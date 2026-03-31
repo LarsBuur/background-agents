@@ -1246,6 +1246,8 @@ async function handleSlackEvent(
 
   // Handle thread replies in channels without @mention — if the bot has an active session
   // for this thread, treat it as a follow-up message so users don't need to @mention every time.
+  // Skip messages containing @mentions (e.g., "<@U...>") since those are already handled
+  // by the app_mention event above and would otherwise be processed twice.
   if (
     event.type === "message" &&
     !event.subtype &&
@@ -1254,7 +1256,8 @@ async function handleSlackEvent(
     event.channel &&
     event.ts &&
     event.user &&
-    event.channel_type !== "im" // DMs are already handled above
+    event.channel_type !== "im" && // DMs are already handled above
+    !/<@[^>]+>/.test(event.text) // Skip @mentions — handled by app_mention event
   ) {
     const existingSession = await lookupThreadSession(env, event.channel, event.thread_ts);
     if (existingSession) {

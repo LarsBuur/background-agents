@@ -197,11 +197,14 @@ class TestResolveAndSetupTunnels:
         sandbox.exec = MagicMock()
         sandbox.exec.aio = AsyncMock(side_effect=Exception("exec failed"))
 
-        with patch.object(
-            SandboxManager,
-            "_resolve_tunnels",
-            new_callable=AsyncMock,
-            return_value=tunnel_urls,
+        with (
+            patch.object(
+                SandboxManager,
+                "_resolve_tunnels",
+                new_callable=AsyncMock,
+                return_value=tunnel_urls,
+            ),
+            patch("src.sandbox.manager.log") as mock_log,
         ):
             _cs_url, _ttyd_url, extra = await SandboxManager._resolve_and_setup_tunnels(
                 sandbox, "sb-1", False, False, [3000]
@@ -209,6 +212,8 @@ class TestResolveAndSetupTunnels:
 
         # Should still return the URLs despite the write failure
         assert extra == {3000: "https://tunnel-3000.example.com"}
+        mock_log.warn.assert_called_once()
+        assert mock_log.warn.call_args[0][0] == "tunnel.urls_write_failed"
 
     @pytest.mark.asyncio
     async def test_tunnel_file_wait_failure_does_not_raise(self):
@@ -221,11 +226,14 @@ class TestResolveAndSetupTunnels:
         sandbox.exec = MagicMock()
         sandbox.exec.aio = AsyncMock(return_value=proc)
 
-        with patch.object(
-            SandboxManager,
-            "_resolve_tunnels",
-            new_callable=AsyncMock,
-            return_value=tunnel_urls,
+        with (
+            patch.object(
+                SandboxManager,
+                "_resolve_tunnels",
+                new_callable=AsyncMock,
+                return_value=tunnel_urls,
+            ),
+            patch("src.sandbox.manager.log") as mock_log,
         ):
             _cs_url, _ttyd_url, extra = await SandboxManager._resolve_and_setup_tunnels(
                 sandbox, "sb-1", False, False, [3000]
@@ -234,6 +242,8 @@ class TestResolveAndSetupTunnels:
         # Should still return the URLs despite the wait failure
         assert extra == {3000: "https://tunnel-3000.example.com"}
         sandbox.exec.aio.assert_called_once()
+        mock_log.warn.assert_called_once()
+        assert mock_log.warn.call_args[0][0] == "tunnel.urls_write_failed"
 
 
 class TestCollectExposedPorts:

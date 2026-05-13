@@ -10,7 +10,7 @@ output "project_name" {
 
 output "production_url" {
   description = "The production URL of the project"
-  value       = "https://${vercel_project.this.name}.vercel.app"
+  value       = var.custom_domain != null ? "https://${var.custom_domain}" : "https://${vercel_project.this.name}.vercel.app"
 }
 
 output "custom_domain" {

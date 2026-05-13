@@ -15,6 +15,8 @@ module "web_app" {
   install_command = "cd ../.. && npm install && npm run build -w @open-inspect/shared"
   build_command   = "next build"
 
+  custom_domain = trimprefix(local.web_app_url, "https://")
+
   environment_variables = [
     # GitHub OAuth
     {

@@ -12,7 +12,7 @@ locals {
   web_app_url = var.web_platform == "cloudflare" ? (
     "https://open-inspect-web-${local.name_suffix}.${var.cloudflare_worker_subdomain}.workers.dev"
     ) : (
-    "https://open-inspect-${local.name_suffix}.vercel.app"
+    "https://agents.bandcizer.io"
   )
 
   # Worker script paths (deterministic output locations)

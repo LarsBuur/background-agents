@@ -491,7 +491,7 @@ async function publishAppHome(env: Env, userId: string): Promise<void> {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "Configure your Open-Inspect preferences below.",
+        text: "Configure your R2 preferences below.",
       },
     },
     { type: "divider" },

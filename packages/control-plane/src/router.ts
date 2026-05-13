@@ -9,7 +9,7 @@ import type {
   CreateSessionResponse,
   SpawnSource,
 } from "./types";
-import { generateId, encryptToken } from "./auth/crypto";
+import { generateId, encryptTokenPair } from "./auth/crypto";
 import { verifyInternalToken } from "./auth/internal";
 import {
   buildMediaObjectKey,
@@ -32,6 +32,7 @@ import { SessionIndexStore } from "./db/session-index";
 import { UserScmTokenStore, DEFAULT_TOKEN_LIFETIME_MS } from "./db/user-scm-tokens";
 import { UserStore, type ProviderIdentity } from "./db/user-store";
 import { buildSessionInternalUrl, SessionInternalPaths } from "./session/contracts";
+import { initializeSession, type SessionInitInput } from "./session/initialize";
 
 import {
   getValidModelOrDefault,
@@ -64,6 +65,7 @@ import { secretsRoutes } from "./routes/secrets";
 import { automationRoutes } from "./routes/automations";
 import { mcpServerRoutes } from "./routes/mcp-servers";
 import { analyticsRoutes } from "./routes/analytics";
+import { handleSlackNotify } from "./routes/slack-notify";
 import { webhookRoutes } from "./webhooks";
 
 const logger = createLogger("router");
@@ -194,6 +196,7 @@ const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/children$/, // POST spawn, GET list
   /^\/sessions\/[^/]+\/children\/[^/]+$/, // GET child detail
   /^\/sessions\/[^/]+\/children\/[^/]+\/cancel$/, // POST cancel child
+  /^\/sessions\/[^/]+\/slack-notify$/, // Agent-initiated Slack notification
 ];
 
 type CachedScmProvider =
@@ -503,6 +506,13 @@ const routes: Route[] = [
     handler: handleUnarchiveSession,
   },
 
+  // Agent-initiated Slack notification (sandbox-authenticated)
+  {
+    method: "POST",
+    pattern: parsePattern("/sessions/:id/slack-notify"),
+    handler: handleSlackNotify,
+  },
+
   // Child session management (sandbox-authenticated)
   {
     method: "POST",
@@ -770,6 +780,91 @@ function resolveProviderIdentity(
   }
 }
 
+/**
+ * Parse a bot-format authorId into provider + providerUserId.
+ * Returns null for web client authorIds (plain user IDs without a prefix).
+ */
+export function parseAuthorId(
+  authorId: string
+): { provider: string; providerUserId: string } | null {
+  const match = authorId.match(/^(github|slack|linear):(.+)$/);
+  if (!match) return null;
+  return { provider: match[1], providerUserId: match[2] };
+}
+
+/**
+ * Construct a canonical userId from the bot's identity fields, matching the
+ * format each bot uses for prompt `authorId`. This ensures the owner
+ * participant created at init is findable when the bot later sends a prompt.
+ */
+export function deriveUserId(body: {
+  userId?: string;
+  spawnSource?: SpawnSource;
+  scmUserId?: string;
+  actorUserId?: string;
+}): string {
+  switch (body.spawnSource) {
+    case "github-bot":
+      return body.scmUserId ? `github:${body.scmUserId}` : "anonymous";
+    case "slack-bot":
+      return body.actorUserId ? `slack:${body.actorUserId}` : "anonymous";
+    case "linear-bot":
+      return body.actorUserId ? `linear:${body.actorUserId}` : "anonymous";
+    default:
+      return body.userId || "anonymous";
+  }
+}
+
+interface GitHubEnrichment {
+  scmUserId: string;
+  scmLogin?: string;
+  displayName?: string;
+  email?: string;
+  accessTokenEncrypted?: string;
+  refreshTokenEncrypted?: string;
+  tokenExpiresAt?: number;
+}
+
+/**
+ * Given a resolved D1 user, find their linked GitHub identity and return
+ * enrichment data (display name, email, OAuth tokens). Returns null if no
+ * GitHub identity is linked. Parallelizes independent D1 lookups.
+ */
+async function resolveGitHubEnrichment(
+  env: Env,
+  userStore: UserStore,
+  userId: string
+): Promise<GitHubEnrichment | null> {
+  const identities = await userStore.getIdentitiesForUser(userId);
+  const githubIdentity = identities.find((i) => i.provider === "github");
+  if (!githubIdentity) return null;
+
+  const [user, tokens] = await Promise.all([
+    userStore.getUserById(userId),
+    env.TOKEN_ENCRYPTION_KEY
+      ? new UserScmTokenStore(env.DB, env.TOKEN_ENCRYPTION_KEY).getEncryptedTokens(
+          githubIdentity.providerUserId
+        )
+      : null,
+  ]);
+
+  const email =
+    githubIdentity.providerEmail ??
+    (githubIdentity.providerLogin
+      ? `${githubIdentity.providerUserId}+${githubIdentity.providerLogin}@users.noreply.github.com`
+      : undefined);
+
+  return {
+    scmUserId: githubIdentity.providerUserId,
+    scmLogin: githubIdentity.providerLogin ?? undefined,
+    displayName: user?.displayName ?? githubIdentity.providerLogin ?? undefined,
+    email,
+    accessTokenEncrypted: tokens?.accessTokenEncrypted,
+    refreshTokenEncrypted: tokens?.refreshTokenEncrypted,
+    tokenExpiresAt: tokens?.expiresAt,
+  };
+}
+
 async function handleCreateSession(
   request: Request,
   env: Env,
@@ -810,15 +905,15 @@ async function handleCreateSession(
 
   const { repoId, defaultBranch } = resolved;
 
-  const userId = body.userId || "anonymous";
+  const userId = deriveUserId(body);
 
   // Resolve canonical user model ID (for D1 session index).
   // Best-effort: if resolution fails, the session is created without a user_id.
+  const userStore = new UserStore(env.DB);
   let resolvedUserId: string | null = null;
   const providerIdentity = resolveProviderIdentity(body.spawnSource ?? "user", body);
   if (providerIdentity) {
     try {
-      const userStore = new UserStore(env.DB);
       const resolvedUser = await userStore.resolveOrCreateUser(providerIdentity);
       resolvedUserId = resolvedUser.id;
     } catch (e) {
@@ -829,44 +924,52 @@ async function handleCreateSession(
     }
   }
 
-  const scmLogin = body.scmLogin;
-  const scmName = body.scmName;
-  const scmEmail = body.scmEmail;
+  let scmLogin = body.scmLogin;
+  let scmName = body.scmName;
+  let scmEmail = body.scmEmail;
   const scmToken = body.scmToken;
   const scmRefreshToken = body.scmRefreshToken;
-  const scmTokenExpiresAt = body.scmTokenExpiresAt;
-  const scmUserId = body.scmUserId;
+  let scmTokenExpiresAt = body.scmTokenExpiresAt;
+  let scmUserId = body.scmUserId;
   let scmTokenEncrypted: string | null = null;
   let scmRefreshTokenEncrypted: string | null = null;
 
-  // If SCM token provided, encrypt it
-  if (scmToken && env.TOKEN_ENCRYPTION_KEY) {
+  if (env.TOKEN_ENCRYPTION_KEY) {
     try {
-      scmTokenEncrypted = await encryptToken(scmToken, env.TOKEN_ENCRYPTION_KEY);
+      ({
+        accessTokenEncrypted: scmTokenEncrypted,
+        refreshTokenEncrypted: scmRefreshTokenEncrypted,
+      } = await encryptTokenPair(scmToken, scmRefreshToken, env.TOKEN_ENCRYPTION_KEY));
     } catch (e) {
       logger.error("Failed to encrypt SCM token", {
-        error: e instanceof Error ? e : String(e),
+        error: e instanceof Error ? e.message : String(e),
       });
       return error("Failed to process SCM token", 500);
     }
   }
 
-  if (scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
+  // Enrich owner participant with linked GitHub identity from D1.
+  // Fills in SCM fields the bot didn't provide (email, display name, OAuth tokens).
+  if (resolvedUserId) {
     try {
-      scmRefreshTokenEncrypted = await encryptToken(scmRefreshToken, env.TOKEN_ENCRYPTION_KEY);
+      const enrichment = await resolveGitHubEnrichment(env, userStore, resolvedUserId);
+      if (enrichment) {
+        scmUserId ??= enrichment.scmUserId;
+        scmLogin ??= enrichment.scmLogin;
+        scmName ??= enrichment.displayName;
+        scmEmail ??= enrichment.email;
+        if (!scmTokenEncrypted) {
+          scmTokenEncrypted = enrichment.accessTokenEncrypted ?? null;
+          scmRefreshTokenEncrypted = enrichment.refreshTokenEncrypted ?? null;
+          scmTokenExpiresAt = enrichment.tokenExpiresAt;
+        }
+      }
     } catch (e) {
-      logger.warn("Session created without refresh token — token refresh will be unavailable", {
+      logger.warn("Failed to enrich session with GitHub identity", {
         error: e instanceof Error ? e : String(e),
       });
     }
   }
-
-  // Generate session ID
-  const sessionId = generateId();
-
-  // Get Durable Object
-  const doId = env.SESSION.idFromName(sessionId);
-  const stub = env.SESSION.get(doId);
 
   // Validate model and reasoning effort once for both DO init and D1 index
   const model = getValidModelOrDefault(body.model);
@@ -881,61 +984,40 @@ async function handleCreateSession(
     resolveSandboxSettings(env.DB, repoOwner, repoName),
   ]);
 
-  // Store session in D1 before initializing the SessionDO. SessionDO init starts
-  // sandbox warming, so D1 failures must fail before any sandbox can be spawned.
-  const now = Date.now();
-  const sessionStore = new SessionIndexStore(env.DB);
-  await sessionStore.create({
-    id: sessionId,
-    title: body.title || null,
+  const sessionId = generateId();
+
+  const input: SessionInitInput = {
+    sessionId,
     repoOwner,
     repoName,
+    repoId,
+    defaultBranch,
+    branch: body.branch,
+    title: body.title,
     model,
     reasoningEffort,
-    baseBranch: body.branch || defaultBranch || "main",
-    status: "created",
+    participantUserId: userId,
+    platformUserId: resolvedUserId,
+    scmLogin,
+    scmName,
+    scmEmail,
+    scmUserId,
+    scmTokenEncrypted,
+    scmRefreshTokenEncrypted,
+    scmTokenExpiresAt,
+    codeServerEnabled,
+    sandboxSettings,
     spawnSource: body.spawnSource,
-    scmLogin: scmLogin || null,
-    userId: resolvedUserId,
-    createdAt: now,
-    updatedAt: now,
-  });
+  };
 
-  // Initialize session with user info and optional encrypted token
-  const initResponse = await stub.fetch(
-    internalRequest(
-      buildSessionInternalUrl(SessionInternalPaths.init),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionName: sessionId, // Pass the session name for WebSocket routing
-          repoOwner,
-          repoName,
-          repoId,
-          defaultBranch,
-          branch: body.branch,
-          title: body.title,
-          model,
-          reasoningEffort,
-          userId,
-          scmLogin,
-          scmName,
-          scmEmail,
-          scmTokenEncrypted,
-          scmRefreshTokenEncrypted,
-          scmTokenExpiresAt,
-          scmUserId,
-          codeServerEnabled,
-          sandboxSettings,
-          spawnSource: body.spawnSource,
-        }),
-      },
-      ctx
-    )
-  );
-
-  if (!initResponse.ok) {
+  try {
+    await initializeSession(env, input, ctx);
+  } catch (e) {
+    logger.error("Failed to initialize session", {
+      error: e instanceof Error ? e.message : String(e),
+      session_id: sessionId,
+      trace_id: ctx.trace_id,
+    });
     return error("Failed to create session", 500);
   }
 
@@ -1031,6 +1113,27 @@ async function handleSessionPrompt(
     return error("content is required");
   }
 
+  const authorId = body.authorId || "anonymous";
+
+  // Enrich bot-originated prompts with linked GitHub identity from D1.
+  // Web client authorIds have no provider prefix — parseAuthorId returns null, skipping this.
+  let enrichment: GitHubEnrichment | undefined;
+  const parsed = parseAuthorId(authorId);
+  if (parsed) {
+    try {
+      const userStore = new UserStore(env.DB);
+      const identity = await userStore.getIdentity(parsed.provider, parsed.providerUserId);
+      if (identity) {
+        enrichment = (await resolveGitHubEnrichment(env, userStore, identity.userId)) ?? undefined;
+      }
+    } catch (e) {
+      logger.warn("Failed to enrich prompt with GitHub identity", {
+        error: e instanceof Error ? e : String(e),
+        authorId,
+      });
+    }
+  }
+
   const doId = env.SESSION.idFromName(sessionId);
   const stub = env.SESSION.get(doId);
 
@@ -1042,12 +1145,19 @@ async function handleSessionPrompt(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           content: body.content,
-          authorId: body.authorId || "anonymous",
+          authorId,
           source: body.source || "web",
           model: body.model,
           reasoningEffort: body.reasoningEffort,
           attachments: body.attachments,
           callbackContext: body.callbackContext,
+          authorDisplayName: enrichment?.displayName,
+          authorEmail: enrichment?.email,
+          authorLogin: enrichment?.scmLogin,
+          scmUserId: enrichment?.scmUserId,
+          scmAccessTokenEncrypted: enrichment?.accessTokenEncrypted,
+          scmRefreshTokenEncrypted: enrichment?.refreshTokenEncrypted,
+          scmTokenExpiresAt: enrichment?.tokenExpiresAt,
         }),
       },
       ctx
@@ -1589,35 +1699,24 @@ async function handleSessionWsToken(
   const scmRefreshToken = body.scmRefreshToken;
 
   // Encrypt the SCM tokens if provided
-  const { scmTokenEncrypted, scmRefreshTokenEncrypted } = await ctx.metrics.time(
-    "encrypt_tokens",
-    async () => {
-      let accessToken: string | null = null;
-      let refreshToken: string | null = null;
+  let scmTokenEncrypted: string | null = null;
+  let scmRefreshTokenEncrypted: string | null = null;
 
-      if (scmToken && env.TOKEN_ENCRYPTION_KEY) {
-        try {
-          accessToken = await encryptToken(scmToken, env.TOKEN_ENCRYPTION_KEY);
-        } catch (e) {
-          logger.error("Failed to encrypt SCM token", {
-            error: e instanceof Error ? e : String(e),
-          });
-        }
-      }
-
-      if (scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
-        try {
-          refreshToken = await encryptToken(scmRefreshToken, env.TOKEN_ENCRYPTION_KEY);
-        } catch (e) {
-          logger.error("Failed to encrypt SCM refresh token", {
-            error: e instanceof Error ? e : String(e),
-          });
-        }
-      }
-
-      return { scmTokenEncrypted: accessToken, scmRefreshTokenEncrypted: refreshToken };
+  if (env.TOKEN_ENCRYPTION_KEY) {
+    try {
+      ({
+        accessTokenEncrypted: scmTokenEncrypted,
+        refreshTokenEncrypted: scmRefreshTokenEncrypted,
+      } = await ctx.metrics.time("encrypt_tokens", () =>
+        encryptTokenPair(scmToken, scmRefreshToken, env.TOKEN_ENCRYPTION_KEY!)
+      ));
+    } catch (e) {
+      logger.error("Failed to encrypt SCM tokens", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return error("Failed to process SCM tokens", 500);
     }
-  );
+  }
 
   // Populate D1 with the user's SCM tokens (non-blocking) so centralized refresh works
   if (scmUserId && scmToken && scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
@@ -1703,16 +1802,6 @@ async function handleUpdateSessionTitle(
     )
   );
 
-  if (response.ok) {
-    // read the validated title from the DO response
-    const doResult = (await response.clone().json()) as { title: string };
-    const sessionStore = new SessionIndexStore(env.DB);
-    const updated = await sessionStore.updateTitle(sessionId, doResult.title);
-    if (!updated) {
-      logger.warn("Session not found in D1 index during title update", { session_id: sessionId });
-    }
-  }
-
   return response;
 }
 
@@ -1749,15 +1838,6 @@ async function handleArchiveSession(
     )
   );
 
-  if (response.ok) {
-    // Update D1 index
-    const sessionStore = new SessionIndexStore(env.DB);
-    const updated = await sessionStore.updateStatus(sessionId, "archived");
-    if (!updated) {
-      logger.warn("Session not found in D1 index during archive", { session_id: sessionId });
-    }
-  }
-
   return response;
 }
 
@@ -1793,15 +1873,6 @@ async function handleUnarchiveSession(
       ctx
     )
   );
-
-  if (response.ok) {
-    // Update D1 index
-    const sessionStore = new SessionIndexStore(env.DB);
-    const updated = await sessionStore.updateStatus(sessionId, "active");
-    if (!updated) {
-      logger.warn("Session not found in D1 index during unarchive", { session_id: sessionId });
-    }
-  }
 
   return response;
 }
@@ -1869,11 +1940,6 @@ async function handleSpawnChild(
     return error("Child sessions must use the same repository as the parent", 403);
   }
 
-  // Create child session (same pattern as handleCreateSession)
-  const childId = generateId();
-  const childDoId = env.SESSION.idFromName(childId);
-  const childStub = env.SESSION.get(childDoId);
-
   // Validate explicit model from the agent; reject invalid names so the agent
   // can self-correct instead of silently falling back to the default model.
   const rawModel = body.model ?? spawnContext.model;
@@ -1887,6 +1953,7 @@ async function handleSpawnChild(
       : spawnContext.reasoningEffort;
 
   const childDepth = parentDepth + 1;
+  const childId = generateId();
 
   logger.info("Spawning child session", {
     event: "session.spawn_child",
@@ -1902,66 +1969,46 @@ async function handleSpawnChild(
     resolveSandboxSettings(env.DB, spawnContext.repoOwner, spawnContext.repoName),
   ]);
 
-  // Initialize child DO
-  const initResponse = await childStub.fetch(
-    internalRequest(
-      buildSessionInternalUrl(SessionInternalPaths.init),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionName: childId,
-          repoOwner: spawnContext.repoOwner,
-          repoName: spawnContext.repoName,
-          repoId: spawnContext.repoId,
-          title: body.title,
-          model,
-          reasoningEffort,
-          userId: spawnContext.owner.userId,
-          scmLogin: spawnContext.owner.scmLogin,
-          scmName: spawnContext.owner.scmName,
-          scmEmail: spawnContext.owner.scmEmail,
-          scmTokenEncrypted: spawnContext.owner.scmAccessTokenEncrypted,
-          scmRefreshTokenEncrypted: spawnContext.owner.scmRefreshTokenEncrypted,
-          scmTokenExpiresAt: spawnContext.owner.scmTokenExpiresAt,
-          scmUserId: spawnContext.owner.scmUserId,
-          branch: spawnContext.baseBranch ?? "main",
-          parentSessionId: parentId,
-          spawnSource: "agent",
-          spawnDepth: childDepth,
-          codeServerEnabled: childCodeServerEnabled,
-          sandboxSettings: childSandboxSettings,
-        }),
-      },
-      ctx
-    )
-  );
-
-  if (!initResponse.ok) {
-    return error("Failed to create child session", 500);
-  }
-
-  // Store in D1 index
-  const now = Date.now();
-  await sessionStore.create({
-    id: childId,
-    title: body.title,
+  const input: SessionInitInput = {
+    sessionId: childId,
     repoOwner: spawnContext.repoOwner,
     repoName: spawnContext.repoName,
+    repoId: spawnContext.repoId,
+    branch: spawnContext.baseBranch ?? "main",
+    title: body.title,
     model,
     reasoningEffort,
-    baseBranch: spawnContext.baseBranch ?? "main",
-    status: "created",
+    participantUserId: spawnContext.owner.userId,
+    platformUserId: parentUserId,
+    scmLogin: spawnContext.owner.scmLogin,
+    scmName: spawnContext.owner.scmName,
+    scmEmail: spawnContext.owner.scmEmail,
+    scmUserId: spawnContext.owner.scmUserId,
+    scmTokenEncrypted: spawnContext.owner.scmAccessTokenEncrypted,
+    scmRefreshTokenEncrypted: spawnContext.owner.scmRefreshTokenEncrypted,
+    scmTokenExpiresAt: spawnContext.owner.scmTokenExpiresAt,
+    codeServerEnabled: childCodeServerEnabled,
+    sandboxSettings: childSandboxSettings,
     parentSessionId: parentId,
     spawnSource: "agent",
     spawnDepth: childDepth,
-    scmLogin: spawnContext.owner.scmLogin || null,
-    userId: parentUserId,
-    createdAt: now,
-    updatedAt: now,
-  });
+  };
+
+  try {
+    await initializeSession(env, input, ctx);
+  } catch (e) {
+    logger.error("Failed to initialize child session", {
+      error: e instanceof Error ? e.message : String(e),
+      parent_id: parentId,
+      child_id: childId,
+      trace_id: ctx.trace_id,
+    });
+    return error("Failed to create child session", 500);
+  }
 
   // Enqueue the prompt on the child DO
+  const childDoId = env.SESSION.idFromName(childId);
+  const childStub = env.SESSION.get(childDoId);
   let promptResponse: Response;
   try {
     promptResponse = await childStub.fetch(
@@ -2096,11 +2143,6 @@ async function handleCancelChild(
   const response = await childStub.fetch(
     internalRequest(buildSessionInternalUrl(SessionInternalPaths.cancel), { method: "POST" }, ctx)
   );
-
-  // Update D1 status if cancel succeeded
-  if (response.ok) {
-    await sessionStore.updateStatus(childId, "cancelled");
-  }
 
   return response;
 }

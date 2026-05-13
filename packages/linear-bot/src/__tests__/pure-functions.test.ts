@@ -5,7 +5,27 @@ import {
   resolveStaticRepo,
 } from "../model-resolution";
 import { isValidPayload, verifyCallbackSignature } from "../callbacks";
+import { buildOAuthSuccessHtml } from "../index";
 import type { CompletionCallback } from "../types";
+
+describe("buildOAuthSuccessHtml", () => {
+  it("renders the configured app name in the heading", () => {
+    const html = buildOAuthSuccessHtml("Acme Bot", "My Workspace");
+    expect(html).toContain("<h1>Acme Bot Agent Installed!</h1>");
+    expect(html).toContain("<strong>My Workspace</strong>");
+  });
+
+  it("escapes the app name to prevent HTML injection", () => {
+    const html = buildOAuthSuccessHtml("<script>alert(1)</script>", "Acme");
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+
+  it("escapes the workspace name to prevent HTML injection", () => {
+    const html = buildOAuthSuccessHtml("Open-Inspect", "Evil <img src=x>");
+    expect(html).toContain("Evil &lt;img src=x&gt;");
+  });
+});
 
 // ─── extractModelFromLabels ──────────────────────────────────────────────────
 
@@ -24,6 +44,10 @@ describe("extractModelFromLabels", () => {
 
   it("returns GPT 5.5 for model:gpt-5.5 label", () => {
     expect(extractModelFromLabels([{ name: "model:gpt-5.5" }])).toBe("openai/gpt-5.5");
+  });
+
+  it("returns Opus 4.7 for model:opus-4-7 label", () => {
+    expect(extractModelFromLabels([{ name: "model:opus-4-7" }])).toBe("anthropic/claude-opus-4-7");
   });
 
   it("returns null for unknown model label", () => {

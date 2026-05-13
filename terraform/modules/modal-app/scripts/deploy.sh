@@ -43,20 +43,6 @@ fi
 # Ensure Python dependencies are installed (includes sandbox-runtime)
 uv sync --frozen
 
-# Expand editable .pth files into PYTHONPATH so subprocesses spawned by the
-# Modal CLI can import sibling packages (sandbox_runtime). Some Python builds
-# don't auto-process uv's _editable_impl_*.pth files at startup, leaving the
-# editable src dirs off sys.path.
-for pth in .venv/lib/python*/site-packages/*.pth; do
-    [ -f "$pth" ] || continue
-    while IFS= read -r line || [ -n "$line" ]; do
-        [ -d "$line" ] && export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${line}"
-    done < "$pth"
-done
-if [ -n "${PYTHONPATH:-}" ]; then
-    echo "PYTHONPATH: ${PYTHONPATH}"
-fi
-
 # Deploy using Modal CLI (via uv to use the project's virtual environment)
 if [ "${DEPLOY_MODULE}" = "deploy" ]; then
     # Method 1: Use deploy.py wrapper (recommended)

@@ -556,8 +556,8 @@ function HomeContent({
                       onClick={() => fileInputRef.current?.click()}
                       disabled={attachmentsLocked}
                       className="p-2 text-secondary-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition"
-                      title="Attach images"
-                      aria-label="Attach images"
+                      title="Attach files"
+                      aria-label="Attach files"
                     >
                       <PaperclipIcon className="w-5 h-5" />
                     </button>

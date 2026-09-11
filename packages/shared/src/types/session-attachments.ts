@@ -21,6 +21,41 @@ export const SESSION_ATTACHMENT_MIME_TYPES = [
 export const sessionAttachmentMimeTypeSchema = z.enum(SESSION_ATTACHMENT_MIME_TYPES);
 export type SessionAttachmentMimeType = z.infer<typeof sessionAttachmentMimeTypeSchema>;
 
+/** File extensions treated as Markdown when the browser's MIME type is unreliable. */
+export const SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS = [".md", ".markdown"] as const;
+/**
+ * MIME types operating systems assign to Markdown files besides the canonical
+ * `text/markdown`. Chrome on Windows commonly reports `text/plain`, older
+ * registries `text/x-markdown`, and some browsers no type at all. An empty
+ * type is serialized as `application/octet-stream` in multipart bodies, so
+ * the server sees that rather than the empty string.
+ */
+export const SESSION_ATTACHMENT_MARKDOWN_MIME_ALIASES = [
+  "",
+  "application/octet-stream",
+  "text/plain",
+  "text/x-markdown",
+] as const;
+
+export function hasSessionAttachmentMarkdownExtension(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+/**
+ * Canonicalize the MIME type a browser attached to an uploaded file. A `.md`
+ * or `.markdown` file declared with one of the known Markdown aliases becomes
+ * `text/markdown`; every other declared type is returned unchanged so callers
+ * still validate it against {@link SESSION_ATTACHMENT_MIME_TYPES}.
+ */
+export function normalizeSessionAttachmentMimeType(declaredType: string, fileName: string): string {
+  const aliases: readonly string[] = SESSION_ATTACHMENT_MARKDOWN_MIME_ALIASES;
+  if (aliases.includes(declaredType) && hasSessionAttachmentMarkdownExtension(fileName)) {
+    return "text/markdown";
+  }
+  return declaredType;
+}
+
 export const sessionAttachmentIdSchema = z
   .string()
   .min(1)

@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MAX_SESSION_ATTACHMENTS_PER_MESSAGE,
+  SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS,
   SESSION_ATTACHMENT_MIME_TYPES,
+  normalizeSessionAttachmentMimeType,
   sessionAttachmentUploadResponseSchema,
   type SessionAttachmentReference,
 } from "@open-inspect/shared/types/session-attachments";
@@ -20,7 +22,10 @@ const SUPPORTED_MIME_TYPES: ReadonlySet<string> = new Set(SESSION_ATTACHMENT_MIM
 
 // File-picker filter: the accepted MIME types plus the extensions browsers
 // don't always map to a MIME type (notably .md).
-export const ATTACHMENT_ACCEPT = [...SUPPORTED_MIME_TYPES, ".md", ".markdown"].join(",");
+export const ATTACHMENT_ACCEPT = [
+  ...SUPPORTED_MIME_TYPES,
+  ...SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS,
+].join(",");
 export const DEFAULT_ATTACHMENT_ONLY_MESSAGE = "See the attached files.";
 export const SESSION_ATTACHMENT_UPLOAD_TIMEOUT_MS = 60_000;
 const ATTACHMENTS_CHANGED_DURING_UPLOAD = "Attachments changed during upload; please retry";
@@ -35,9 +40,22 @@ function parseUploadErrorMessage(value: unknown): string | null {
 }
 
 function isSupportedAttachment(file: File): boolean {
-  // Some browsers report an empty type for .md; the server sniffs content, so
-  // accept an empty type here and let the upload boundary make the final call.
-  return file.type === "" || SUPPORTED_MIME_TYPES.has(file.type);
+  // Browsers label .md files inconsistently (text/plain, text/x-markdown, or
+  // nothing at all), so canonicalize by extension before checking. An empty
+  // type on any file is passed through; the server sniffs content and makes
+  // the final call at the upload boundary.
+  const mimeType = normalizeSessionAttachmentMimeType(file.type, file.name);
+  return mimeType === "" || SUPPORTED_MIME_TYPES.has(mimeType);
+}
+
+/**
+ * Re-wrap a file whose browser-reported type differs from the canonical one so
+ * the multipart part declares a type the server accepts.
+ */
+function withCanonicalMimeType(file: File): File {
+  const mimeType = normalizeSessionAttachmentMimeType(file.type, file.name);
+  if (mimeType === file.type) return file;
+  return new File([file], file.name, { type: mimeType, lastModified: file.lastModified });
 }
 
 function formatMegabytes(bytes: number): string {
@@ -192,7 +210,11 @@ export function useSessionAttachments() {
           }
 
           const formData = new FormData();
-          formData.append("file", pendingAttachment.file, fileName || "image");
+          formData.append(
+            "file",
+            withCanonicalMimeType(pendingAttachment.file),
+            fileName || "attachment"
+          );
           const timeoutId = window.setTimeout(() => {
             uploadTimedOut = true;
             controller.abort();
@@ -219,7 +241,7 @@ export function useSessionAttachments() {
             throw new Error(`Failed to upload ${fileName}`);
           }
           const attachment: SessionAttachmentReference = {
-            name: fileName || "image-attachment",
+            name: fileName || "attachment",
             attachmentId: uploadResult.data.attachmentId,
           };
           uploadedByIdRef.current.set(pendingAttachment.id, { sessionId, attachment });

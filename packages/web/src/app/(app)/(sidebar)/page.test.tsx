@@ -328,7 +328,7 @@ describe("Home", () => {
     await user.type(screen.getByPlaceholderText("What do you want to build?"), "I");
 
     const warmingStatus = await screen.findByText("Warming sandbox...");
-    const attachmentButton = screen.getByRole("button", { name: "Attach images" });
+    const attachmentButton = screen.getByRole("button", { name: "Attach files" });
     expect(
       warmingStatus.compareDocumentPosition(attachmentButton) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy();

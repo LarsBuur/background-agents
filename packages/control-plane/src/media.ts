@@ -50,6 +50,8 @@ export interface VideoFileType {
 export interface MultipartFileLike {
   size: number;
   type: string;
+  /** Client-supplied file name; present on `File` parts, absent on bare blobs. */
+  name?: string;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 

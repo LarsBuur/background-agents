@@ -19,6 +19,10 @@ export {
   resolvedSessionAttachmentSchema,
   resolvedSessionAttachmentsSchema,
   sessionAttachmentUploadResponseSchema,
+  SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS,
+  SESSION_ATTACHMENT_MARKDOWN_MIME_ALIASES,
+  hasSessionAttachmentMarkdownExtension,
+  normalizeSessionAttachmentMimeType,
 } from "./session-attachments";
 export type {
   SessionAttachmentMimeType,

@@ -130,7 +130,7 @@ describe("SessionPromptComposer", () => {
     expect(input).toBeEnabled();
     fireEvent.change(input, { target: { value: "Updated while connecting" } });
     expect(screen.getByDisplayValue("Updated while connecting")).toBeEnabled();
-    expect(screen.getByTitle("Attach images")).toBeEnabled();
+    expect(screen.getByTitle("Attach files")).toBeEnabled();
     expect(screen.getByRole("button", { name: "Model and effort" })).toBeEnabled();
     expect(screen.getByTitle(/Send/)).toBeDisabled();
   });

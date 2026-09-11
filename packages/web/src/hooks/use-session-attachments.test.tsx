@@ -55,6 +55,33 @@ describe("useSessionAttachments", () => {
     expect(result.current.attachmentError).toBeNull();
   });
 
+  it.each(["text/plain", "text/x-markdown"])(
+    "accepts a markdown file the browser reports as %s",
+    (declaredType) => {
+      vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:md");
+      const { result } = renderHook(() => useSessionAttachments());
+
+      act(() => {
+        result.current.addFiles([new File(["# Notes"], "notes.md", { type: declaredType })]);
+      });
+
+      expect(result.current.attachments).toHaveLength(1);
+      expect(result.current.attachmentError).toBeNull();
+    }
+  );
+
+  it("rejects a plain text file that is not markdown", () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:txt");
+    const { result } = renderHook(() => useSessionAttachments());
+
+    act(() => {
+      result.current.addFiles([new File(["hello"], "notes.txt", { type: "text/plain" })]);
+    });
+
+    expect(result.current.attachments).toEqual([]);
+    expect(result.current.attachmentError).toBe("notes.txt is not a supported attachment type");
+  });
+
   it("rejects images above the portable web request limit", () => {
     const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:image");
     const { result } = renderHook(() => useSessionAttachments());
@@ -72,6 +99,29 @@ describe("useSessionAttachments", () => {
       "large.png is too large (attachments must be under 4 MB)"
     );
     expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("uploads a text/plain .md file with a text/markdown part type", async () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:md");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        Response.json({ attachmentId: "up-md", mimeType: "text/markdown" }, { status: 201 })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderHook(() => useSessionAttachments());
+    act(() => {
+      result.current.addFiles([new File(["# Notes"], "notes.md", { type: "text/plain" })]);
+    });
+    await act(async () => {
+      await result.current.uploadAll("session-1");
+    });
+
+    const body = fetchMock.mock.calls[0]?.[1]?.body as FormData;
+    const part = body.get("file") as File;
+    expect(part.type).toBe("text/markdown");
+    expect(part.name).toBe("notes.md");
   });
 
   it("reuses successful attachment IDs when a later file fails and the user retries", async () => {

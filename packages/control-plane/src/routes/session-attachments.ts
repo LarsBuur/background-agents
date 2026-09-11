@@ -22,6 +22,7 @@ import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import { readBodyCapped } from "@open-inspect/shared/http-body";
 import {
   sessionAttachmentIdSchema,
+  normalizeSessionAttachmentMimeType,
   type SessionAttachmentUploadResponse,
 } from "@open-inspect/shared/types/session-attachments";
 import { generateId } from "../auth/crypto";
@@ -113,7 +114,10 @@ export async function handleAttachmentPost(
     return error("Uploaded file is empty", 400);
   }
 
-  if (fileEntry.type && !isSupportedSessionAttachmentMimeType(fileEntry.type)) {
+  // Browsers disagree on the MIME type of .md files; fold the known aliases
+  // into text/markdown before validating the declared type.
+  const declaredMimeType = normalizeSessionAttachmentMimeType(fileEntry.type, fileEntry.name ?? "");
+  if (declaredMimeType && !isSupportedSessionAttachmentMimeType(declaredMimeType)) {
     return error("Unsupported attachment MIME type", 400);
   }
 
@@ -131,7 +135,7 @@ export async function handleAttachmentPost(
     return error(`Attachments must be ${SESSION_ATTACHMENT_MAX_BYTES} bytes or smaller`, 400);
   }
 
-  if (fileEntry.type && fileEntry.type !== detected.mimeType) {
+  if (declaredMimeType && declaredMimeType !== detected.mimeType) {
     return error("Uploaded file MIME type does not match file contents", 400);
   }
 

@@ -48,6 +48,15 @@ function attachmentUploadRequest(): Request {
   });
 }
 
+function markdownUploadRequest(declaredType: string, fileName = "notes.md"): Request {
+  const form = new FormData();
+  form.append("file", new File(["# Notes\n\nHello"], fileName, { type: declaredType }));
+  return new Request("https://test.local/sessions/session-1/attachments", {
+    method: "POST",
+    body: form,
+  });
+}
+
 function oversizedStreamingUploadRequest(): Request {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -77,6 +86,41 @@ describe("session attachment routes", () => {
 
     expect(response.status).toBe(413);
     expect(fetch).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it.each(["text/markdown", "text/plain", "text/x-markdown", "application/octet-stream", ""])(
+    "stores a .md file the browser declared as %j as text/markdown",
+    async (declaredType) => {
+      const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+      const { env, put } = createEnv(fetch);
+
+      const response = await handleAttachmentPost(
+        markdownUploadRequest(declaredType),
+        env,
+        { id: "session-1" },
+        withSessionRuntime(env, createContext())
+      );
+
+      expect(response.status).toBe(201);
+      await expect(response.json()).resolves.toMatchObject({ mimeType: "text/markdown" });
+      expect(put).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("rejects a text/plain file that is not named as Markdown", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const { env, put } = createEnv(fetch);
+
+    const response = await handleAttachmentPost(
+      markdownUploadRequest("text/plain", "notes.txt"),
+      env,
+      { id: "session-1" },
+      withSessionRuntime(env, createContext())
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "Unsupported attachment MIME type" });
     expect(put).not.toHaveBeenCalled();
   });
 

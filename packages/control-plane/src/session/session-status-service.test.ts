@@ -9,6 +9,7 @@ import type { SessionCoreRepository } from "./session-core-repository";
 import type { ArtifactRepository } from "./artifact-repository";
 import type { MessageRepository } from "./message-repository";
 import type { SessionMessenger } from "./messenger";
+import type { SessionUsageTotals, UsageRepository } from "./usage-repository";
 
 function createSession(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -26,6 +27,7 @@ function createSession(overrides: Partial<SessionRow> = {}): SessionRow {
     model: "anthropic/claude-haiku-4-5",
     reasoning_effort: "high",
     status: "active",
+    status_revision: 1,
     parent_session_id: null,
     spawn_source: "user",
     spawn_depth: 0,
@@ -40,6 +42,19 @@ function createSession(overrides: Partial<SessionRow> = {}): SessionRow {
   } as SessionRow;
 }
 
+function createUsageTotals(overrides: Partial<SessionUsageTotals> = {}): SessionUsageTotals {
+  return {
+    rowCount: 2,
+    inputTokens: 1200,
+    outputTokens: 340,
+    reasoningTokens: 56,
+    cacheReadTokens: 7800,
+    cacheWriteTokens: 910,
+    totalTokens: 10306,
+    ...overrides,
+  };
+}
+
 function harness(options: { session?: SessionRow | null } = {}) {
   const session = options.session === undefined ? createSession() : options.session;
 
@@ -48,6 +63,7 @@ function harness(options: { session?: SessionRow | null } = {}) {
     updateSessionStatus: vi.fn(),
     getPendingOrProcessingCount: vi.fn(() => 0),
     getLatestTerminalMessage: vi.fn(() => null as MessageRow | null),
+    getMessageStatus: vi.fn((_messageId: string): MessageRow["status"] | null => "failed"),
     getMessageCount: vi.fn(() => 3),
     getActiveDurationMs: vi.fn(() => 4500),
   };
@@ -57,12 +73,14 @@ function harness(options: { session?: SessionRow | null } = {}) {
     ),
   } as unknown as ArtifactRepository;
 
+  const usageRepository = {
+    getSessionTotals: vi.fn(() => createUsageTotals()),
+  };
+
   const broadcast = vi.fn();
   const messenger = { broadcast, sendToSandbox: vi.fn(async () => {}) } as SessionMessenger;
 
   const sessionIndex = {
-    updateStatus: vi.fn(async () => true),
-    repairStatus: vi.fn(async () => true),
     finalizeChildAdmission: vi.fn(async () => {}),
     updateMetrics: vi.fn(async () => true),
   };
@@ -82,21 +100,26 @@ function harness(options: { session?: SessionRow | null } = {}) {
   };
   const backgroundTasks = createTestBackgroundTasks();
 
+  const statusProjection = { project: vi.fn(async () => true) };
   const service = new SessionStatusService(
     backgroundTasks,
     log as unknown as Logger,
     repository as unknown as SessionCoreRepository,
     repository as unknown as MessageRepository,
     artifactRepository,
+    usageRepository as unknown as UsageRepository,
     messenger,
     sessionIndex,
+    statusProjection,
     parentSessions
   );
 
   return {
     service,
+    statusProjection,
     repository,
     artifactRepository,
+    usageRepository,
     broadcast,
     sessionIndex,
     backgroundTasks,
@@ -106,6 +129,44 @@ function harness(options: { session?: SessionRow | null } = {}) {
   };
 }
 
+describe("SessionStatusService.confirmIndexStatus", () => {
+  it("confirms the current archive revision through the generic projection", async () => {
+    const h = harness({ session: createSession({ status: "archived" }) });
+    await h.service.confirmIndexStatus("archived");
+    expect(h.statusProjection.project).toHaveBeenCalledWith(
+      "public-session-1",
+      "archived",
+      1,
+      2000
+    );
+  });
+  it("rejects a missing or superseded projection", async () => {
+    const h = harness({ session: createSession({ status: "archived" }) });
+    h.statusProjection.project.mockResolvedValue(false);
+    await expect(h.service.confirmIndexStatus("archived")).rejects.toThrow("missing or superseded");
+  });
+  it("does not project when the local status has changed", async () => {
+    const h = harness();
+    await expect(h.service.confirmIndexStatus("archived")).rejects.toThrow("superseded");
+    expect(h.statusProjection.project).not.toHaveBeenCalled();
+  });
+  it("rejects a newer local generation even if it has the same status", async () => {
+    const h = harness({ session: createSession({ status: "archived" }) });
+    h.statusProjection.project.mockImplementation(async () => {
+      h.repository.getSession.mockReturnValue(
+        createSession({ status: "archived", status_revision: 3 })
+      );
+      return true;
+    });
+    await expect(h.service.confirmIndexStatus("archived")).rejects.toThrow("superseded");
+  });
+  it("propagates projection outages", async () => {
+    const h = harness({ session: createSession({ status: "archived" }) });
+    h.statusProjection.project.mockRejectedValue(new Error("D1 unavailable"));
+    await expect(h.service.confirmIndexStatus("archived")).rejects.toThrow("D1 unavailable");
+  });
+});
+
 describe("SessionStatusService.transition", () => {
   it("returns false without side effects when there is no session", async () => {
     const h = harness({ session: null });
@@ -113,7 +174,7 @@ describe("SessionStatusService.transition", () => {
     expect(await h.service.transition("active")).toBe(false);
 
     expect(h.repository.updateSessionStatus).not.toHaveBeenCalled();
-    expect(h.sessionIndex.updateStatus).not.toHaveBeenCalled();
+    expect(h.statusProjection.project).not.toHaveBeenCalled();
     expect(h.broadcast).not.toHaveBeenCalled();
   });
 
@@ -129,9 +190,10 @@ describe("SessionStatusService.transition", () => {
     );
     const updatedAt = h.repository.updateSessionStatus.mock.calls[0][2] as number;
     expect(updatedAt).toBeGreaterThan(2000);
-    expect(h.sessionIndex.updateStatus).toHaveBeenCalledWith(
+    expect(h.statusProjection.project).toHaveBeenCalledWith(
       "public-session-1",
       "active",
+      2,
       updatedAt
     );
     expect(h.sessionIndex.finalizeChildAdmission).toHaveBeenCalledWith("public-session-1");
@@ -143,7 +205,7 @@ describe("SessionStatusService.transition", () => {
 
     expect(await h.service.transition("active")).toBe(false);
 
-    expect(h.sessionIndex.updateStatus).toHaveBeenCalledWith("public-session-1", "active", 2000);
+    expect(h.statusProjection.project).toHaveBeenCalledWith("public-session-1", "active", 1, 2000);
     expect(h.repository.updateSessionStatus).not.toHaveBeenCalled();
     expect(h.broadcast).not.toHaveBeenCalled();
     expect(h.parentFetch).not.toHaveBeenCalled();
@@ -159,8 +221,57 @@ describe("SessionStatusService.transition", () => {
       activeDurationMs: 4500,
       messageCount: 3,
       prCount: 2,
+      inputTokens: 1200,
+      outputTokens: 340,
+      reasoningTokens: 56,
+      cacheReadTokens: 7800,
+      cacheWriteTokens: 910,
     });
     expect(h.backgroundTasks.submissions).not.toHaveLength(0);
+  });
+
+  it("projects token kinds no step reported as zero", async () => {
+    const h = harness({ session: createSession({ status: "active" }) });
+    h.usageRepository.getSessionTotals.mockReturnValue(
+      createUsageTotals({
+        rowCount: 0,
+        inputTokens: null,
+        outputTokens: null,
+        reasoningTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        totalTokens: null,
+      })
+    );
+
+    await h.service.transition("completed");
+
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledWith(
+      "public-session-1",
+      expect.objectContaining({
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      })
+    );
+  });
+
+  it("absorbs a usage totals read failure in the metrics background task", async () => {
+    const h = harness({
+      session: createSession({ status: "active", parent_session_id: "parent-1" }),
+    });
+    const error = new Error("Malformed step usage totals row");
+    h.usageRepository.getSessionTotals.mockImplementation(() => {
+      throw error;
+    });
+
+    expect(await h.service.transition("completed")).toBe(true);
+
+    expect(h.backgroundTasks.failures).toEqual([error]);
+    expect(h.sessionIndex.updateMetrics).not.toHaveBeenCalled();
+    expect(h.parentFetch).toHaveBeenCalledTimes(1);
   });
 
   it("syncs metrics even when already in the terminal status", async () => {
@@ -182,9 +293,85 @@ describe("SessionStatusService.transition", () => {
     expect(h.sessionIndex.updateMetrics).not.toHaveBeenCalled();
   });
 
+  it("defers a step of the processing turn but projects one whose turn has ended", () => {
+    // A budget stop leaves a queued prompt that keeps the session active.
+    const h = harness({ session: createSession({ status: "active" }) });
+    h.repository.getMessageStatus.mockReturnValueOnce("processing");
+
+    h.service.refreshMetricsAfterStep("msg-running");
+    expect(h.sessionIndex.updateMetrics).not.toHaveBeenCalled();
+
+    h.service.refreshMetricsAfterStep("msg-stopped");
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledWith(
+      "public-session-1",
+      expect.objectContaining({ inputTokens: 1200 })
+    );
+  });
+
+  it("writes usage that lands during a metrics write after it, never beside it", async () => {
+    const h = harness({ session: createSession({ status: "failed" }) });
+    let releaseFirstWrite!: () => void;
+    h.sessionIndex.updateMetrics.mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => (releaseFirstWrite = () => resolve(true)))
+    );
+
+    expect(await h.service.transition("failed")).toBe(false);
+    h.usageRepository.getSessionTotals.mockReturnValue(createUsageTotals({ inputTokens: 1500 }));
+    h.service.refreshMetricsAfterStep("msg-1");
+    h.service.refreshMetricsAfterStep("msg-1");
+
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledTimes(1);
+    releaseFirstWrite();
+    await h.backgroundTasks.settle();
+
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledTimes(2);
+    expect(h.sessionIndex.updateMetrics).toHaveBeenLastCalledWith(
+      "public-session-1",
+      expect.objectContaining({ inputTokens: 1500 })
+    );
+  });
+
+  it("still writes usage that landed during a metrics write that failed", async () => {
+    const h = harness({ session: createSession({ status: "failed" }) });
+    const error = new Error("d1 down");
+    let failFirstWrite!: () => void;
+    h.sessionIndex.updateMetrics.mockImplementationOnce(
+      () => new Promise<boolean>((_resolve, reject) => (failFirstWrite = () => reject(error)))
+    );
+
+    expect(await h.service.transition("failed")).toBe(false);
+    h.usageRepository.getSessionTotals.mockReturnValue(createUsageTotals({ inputTokens: 1500 }));
+    h.service.refreshMetricsAfterStep("msg-1");
+    failFirstWrite();
+    await h.backgroundTasks.settle();
+
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledTimes(2);
+    expect(h.sessionIndex.updateMetrics).toHaveBeenLastCalledWith(
+      "public-session-1",
+      expect.objectContaining({ inputTokens: 1500 })
+    );
+    expect(h.backgroundTasks.failures).toEqual([error]);
+  });
+
+  it("does not retry a failed metrics write when nothing newer is pending", async () => {
+    const h = harness({ session: createSession({ status: "failed" }) });
+    const error = new Error("d1 down");
+    h.sessionIndex.updateMetrics.mockRejectedValueOnce(error);
+
+    expect(await h.service.transition("failed")).toBe(false);
+    await h.backgroundTasks.settle();
+
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledTimes(1);
+    expect(h.backgroundTasks.failures).toEqual([error]);
+
+    h.service.refreshMetricsAfterStep("msg-1");
+    await h.backgroundTasks.settle();
+    expect(h.sessionIndex.updateMetrics).toHaveBeenCalledTimes(2);
+  });
+
   it("logs index sync failures without throwing", async () => {
     const h = harness({ session: createSession({ status: "created" }) });
-    h.sessionIndex.updateStatus.mockRejectedValue(new Error("d1 down"));
+    h.statusProjection.project.mockRejectedValue(new Error("d1 down"));
 
     expect(await h.service.transition("active")).toBe(true);
 
@@ -232,7 +419,7 @@ describe("SessionStatusService.cancel", () => {
   it("closes local status and unfinished messages before publishing projections", async () => {
     const h = harness({ session: createSession({ status: "active" }) });
     let releaseIndex!: () => void;
-    h.sessionIndex.updateStatus.mockImplementation(
+    h.statusProjection.project.mockImplementation(
       () => new Promise<boolean>((resolve) => (releaseIndex = () => resolve(true)))
     );
     const terminalize = vi.fn();
@@ -355,13 +542,18 @@ describe("SessionStatusService.repairIndexStatus", () => {
 
     await h.service.repairIndexStatus();
 
-    expect(h.sessionIndex.repairStatus).toHaveBeenCalledWith("public-session-1", "completed");
+    expect(h.statusProjection.project).toHaveBeenCalledWith(
+      "public-session-1",
+      "completed",
+      1,
+      2000
+    );
   });
 
   it("logs and propagates repair failures", async () => {
     const h = harness({ session: createSession({ status: "completed" }) });
     const error = new Error("d1 down");
-    h.sessionIndex.repairStatus.mockRejectedValue(error);
+    h.statusProjection.project.mockRejectedValue(error);
 
     await expect(h.service.repairIndexStatus()).rejects.toThrow(error);
 
@@ -401,6 +593,33 @@ describe("SessionStatusService.settleFromMessageState", () => {
       "failed",
       expect.any(Number)
     );
+  });
+});
+
+describe("SessionStatusService.reconcileFromMessageState", () => {
+  it("preserves a completed prompt outcome across an external lifecycle boundary", async () => {
+    const h = harness({ session: createSession({ status: "completed" }) });
+    h.repository.getLatestTerminalMessage.mockReturnValue({ status: "completed" } as MessageRow);
+
+    await h.service.reconcileFromMessageState();
+
+    expect(h.repository.updateSessionStatus).not.toHaveBeenCalled();
+    expect(h.statusProjection.project).toHaveBeenCalledWith(
+      "public-session-1",
+      "completed",
+      1,
+      2000
+    );
+  });
+
+  it("preserves a user-selected closed status", async () => {
+    const h = harness({ session: createSession({ status: "archived" }) });
+    h.repository.getLatestTerminalMessage.mockReturnValue({ status: "completed" } as MessageRow);
+
+    await h.service.reconcileFromMessageState();
+
+    expect(h.repository.updateSessionStatus).not.toHaveBeenCalled();
+    expect(h.broadcast).not.toHaveBeenCalled();
   });
 });
 

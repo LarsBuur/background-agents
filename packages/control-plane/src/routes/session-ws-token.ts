@@ -2,10 +2,9 @@ import { Hono } from "hono";
 import { admit } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import { applyIdentityEnforcement } from "../routing/identity-enforcement";
-import { SESSION_WEBSOCKET_CONNECT_PERMISSION } from "@open-inspect/shared/rbac";
 import { SessionInternalPaths, sessionScmDisplayFieldsSchema } from "../session/contracts";
 import type { Env } from "../types";
-import { error, GITHUB_USER_OR_SERVICE_ROUTE, requirePermission } from "./shared";
+import { error, GITHUB_USER_OR_SERVICE_ROUTE, requireSession } from "./shared";
 import { parseJsonBody } from "./body";
 import { dispatchSession, type SessionRouteContext } from "./session-route";
 
@@ -20,9 +19,8 @@ export async function handleSessionWsToken(
   const rawBody = await parseJsonBody(request);
   if (rawBody instanceof Response) return rawBody;
 
-  // The participant identity comes from the verified principal; body SCM
-  // credentials are rejected (tokens arrive via the exchange; enrichment
-  // reads the store server-side).
+  // The participant identity comes from the verified principal. Current
+  // callers send identity/display fields only; token fields are rejected.
   const enforcement = applyIdentityEnforcement(ctx, "ws-token", rawBody);
   if (enforcement.rejection) return enforcement.rejection;
 
@@ -56,7 +54,7 @@ sessionWsTokenRoutes.post(
   "/sessions/:id/ws-token",
   admit({
     ...GITHUB_USER_OR_SERVICE_ROUTE,
-    authorization: requirePermission(SESSION_WEBSOCKET_CONNECT_PERMISSION),
+    authorization: requireSession("read"),
   }),
   (c) => dispatchSession(c, handleSessionWsToken)
 );

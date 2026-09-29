@@ -30,11 +30,13 @@ function makeSlackAutomation(overrides?: Partial<AutomationRow>): AutomationRow 
   const now = Date.now();
   return {
     id: `auto-slack-${Math.random().toString(36).slice(2, 8)}`,
+    owner_team_id: null,
     name: "Slack triage",
     instructions: "Investigate and fix",
     trigger_type: "slack_event",
     schedule_cron: null,
     schedule_tz: "UTC",
+    harness: "opencode",
     model: "anthropic/claude-sonnet-4-6",
     reasoning_effort: null,
     enabled: 1,

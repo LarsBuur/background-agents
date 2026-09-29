@@ -65,25 +65,26 @@ not pass through Hono.
 
 ### Sessions
 
-| Endpoint                        | Method    | Description                    |
-| ------------------------------- | --------- | ------------------------------ |
-| `/sessions`                     | GET       | List workspace sessions        |
-| `/sessions`                     | POST      | Create new session             |
-| `/sessions/:id`                 | GET       | Get canonical session snapshot |
-| `/sessions/:id`                 | DELETE    | Delete session                 |
-| `/sessions/:id/sandbox-access`  | GET       | Get sandbox connection details |
-| `/sessions/:id/prompt`          | POST      | Enqueue prompt                 |
-| `/sessions/:id/stop`            | POST      | Stop execution                 |
-| `/sessions/:id/ws`              | WebSocket | Real-time connection           |
-| `/sessions/:id/events`          | GET       | Paginated events               |
-| `/sessions/:id/artifacts`       | GET       | List artifacts                 |
-| `/sessions/:id/participants`    | GET       | List runtime participants      |
-| `/sessions/:id/messages`        | GET       | List messages                  |
-| `/sessions/:id/pr`              | POST      | Create pull request            |
-| `/sessions/:id/scm-credentials` | POST      | Broker sandbox git credentials |
-| `/sessions/:id/ws-token`        | POST      | Generate WebSocket token       |
-| `/sessions/:id/archive`         | POST      | Archive session                |
-| `/sessions/:id/unarchive`       | POST      | Unarchive session              |
+| Endpoint                        | Method    | Description                          |
+| ------------------------------- | --------- | ------------------------------------ |
+| `/sessions`                     | GET       | List workspace sessions              |
+| `/sessions`                     | POST      | Create new session                   |
+| `/sessions/:id`                 | GET       | Get canonical session snapshot       |
+| `/sessions/:id`                 | DELETE    | Delete session                       |
+| `/sessions/:id/sandbox-access`  | GET       | Get sandbox connection details       |
+| `/sessions/:id/prompt`          | POST      | Enqueue prompt                       |
+| `/sessions/:id/stop`            | POST      | Stop execution                       |
+| `/sessions/:id/ws`              | WebSocket | Real-time connection                 |
+| `/sessions/:id/events`          | GET       | Paginated events                     |
+| `/sessions/:id/artifacts`       | GET       | List artifacts                       |
+| `/sessions/:id/participants`    | GET       | List runtime participants            |
+| `/sessions/:id/messages`        | GET       | List messages                        |
+| `/sessions/:id/pr`              | POST      | Create pull request                  |
+| `/sessions/:id/scm-credentials` | POST      | Broker sandbox git credentials       |
+| `/sessions/:id/ws-token`        | POST      | Generate WebSocket token             |
+| `/sessions/:id/archive`         | POST      | Archive session                      |
+| `/sessions/:id/unarchive`       | POST      | Unarchive session                    |
+| `/sessions/batch-archive`       | POST      | Archive explicitly selected sessions |
 
 ### Create PR Payload
 
@@ -219,6 +220,37 @@ An invocation's status is **derived from its child runs, never stored**: no chil
 any child starting/running → `starting`/`running`; all terminal → `completed` (none failed),
 `failed` (none completed), `partial_failed` (a mix), or `skipped` (all skipped).
 
+### Audit Events
+
+| Endpoint        | Method | Description                                                    |
+| --------------- | ------ | -------------------------------------------------------------- |
+| `/audit-events` | GET    | Newest-first, cursor-paginated events (`workspace.audit.read`) |
+
+Each event has an `action`, a stored `operationResult` (`applied`, `no_op`, `denied`, or
+`rejected`), and structured `metadata`. What a row proves depends on who wrote it:
+
+- **Authorization decisions** (`authorization.request_allowed`, `authorization.request_denied`) are
+  written by route admission. With `metadata.schema = "authorization_decision.v1"` they also record
+  `httpMethod`, `httpPath`, `httpStatus`, and the evaluated `requirements`. They prove only that the
+  request was allowed or denied and which HTTP status it returned. An allowed request may still fail
+  validation (400), conflict (409), or fail downstream (500), and even a 2xx does not prove that a
+  domain change or asynchronous work (a sandbox, job, or external effect) completed. Their
+  `operationResult` encodes the decision (`applied` for allowed, `denied` for denied) and must not
+  be read as a domain outcome. Rows written before the schema existed carry `{ "legacy": true }`
+  metadata and have no recorded status.
+- **Operation events** (the actions in `AUDIT_OPERATION_ACTIONS`, for example
+  `workspace.member_role_updated`) are written by the operation owner alongside the change, so their
+  `operationResult` is the domain outcome.
+- Any other action is unrecognized; clients should not interpret its `operationResult`.
+
+`interpretAuditEvent` in `@open-inspect/shared` implements these rules. It takes the decision from
+the exact action and reports `httpStatus` only when the metadata parses as
+`authorization_decision.v1`.
+
+A feature that needs "operation completed" evidence must emit its own event from the owning
+transaction or workflow, correlated by request ID. That evidence is never inferred from admission or
+from an HTTP 2xx.
+
 ## WebSocket Protocol
 
 ### Client → Server Messages
@@ -246,7 +278,6 @@ any child starting/running → `starting`/`running`; all terminal → `completed
 | `sandbox_spawning` | Sandbox is being created      |
 | `sandbox_warming`  | Sandbox warming               |
 | `sandbox_status`   | Sandbox status update         |
-| `sandbox_ready`    | Sandbox ready                 |
 | `sandbox_error`    | Sandbox error occurred        |
 | `sandbox_warning`  | Sandbox warning message       |
 | `sandbox_restored` | Restored from snapshot        |
@@ -259,7 +290,7 @@ any child starting/running → `starting`/`running`; all terminal → `completed
 
 ### Prerequisites
 
-- Node.js 22+
+- Node.js 24+
 - Terraform (for deployment)
 
 ### Setup
@@ -373,7 +404,7 @@ requests so the React `/login` route can render them server-side.
 Three independent key domains protect stored credentials. Rotation guidance differs — never treat
 them as interchangeable during an incident:
 
-- **`TOKEN_ENCRYPTION_KEY`** — AES-256-GCM for the SCM enrichment tokens in `user_scm_tokens`:
+- **`TOKEN_ENCRYPTION_KEY`** — AES-256-GCM for SCM access tokens copied into session participants:
 
   ```typescript
   import { encryptToken, decryptToken } from "./auth/crypto";
@@ -385,13 +416,14 @@ them as interchangeable during an incident:
   const token = await decryptToken(encrypted, env.TOKEN_ENCRYPTION_KEY);
   ```
 
-  Rotating it invalidates stored SCM tokens; affected users re-link their SCM connection.
+  Rotating it invalidates SCM credentials already copied into sessions. New sessions resolve current
+  GitHub credentials through Better Auth.
 
 - **`BROWSER_AUTH_SECRET`** — Better Auth's secret. It signs browser session cookies **and**
   encrypts the sign-in OAuth credential columns on `user_identities` (`access_token`,
   `refresh_token`, `id_token`, written at web sign-in and read via `auth.api.getAccessToken`).
   Rotating it signs every browser session out and orphans those stored credentials — they
-  re-populate at each user's next sign-in. It does not affect `user_scm_tokens`.
+  re-populate at each user's next sign-in.
 
 - **`PROVIDER_ACCOUNTS_ENCRYPTION_KEY`** — dedicated AES-256-GCM key for subscription-provider
   account credentials. Provider account mode stores only account references on sessions and brokers
@@ -410,6 +442,54 @@ Existing sessions remain pinned to their stored authentication mode.
 
 > **Single-Tenant Only**: This control plane is designed for single-tenant deployment where all
 > users are trusted members of the same organization.
+
+Bulk archiving uses `POST /sessions/batch-archive` with an explicit selection:
+
+```json
+{ "sessionIds": ["session-one", "session-two"] }
+```
+
+The request requires 1–25 unique, non-empty session IDs. Unknown fields and the old operator cursor
+format are rejected. The caller must be an authenticated human holding `sessions.bulk_archive`,
+granted to Owner and Administrator by default and available to custom roles. Admission and
+authorization auditing use the ordinary RBAC pipeline. Single-session `/sessions/:id/archive`
+continues to use workspace `sessions.lifecycle`; it is not participant-scoped.
+
+A valid batch returns HTTP 200 with one result per ID, in request order:
+
+```json
+{
+  "results": [
+    { "sessionId": "session-one", "outcome": "archived" },
+    { "sessionId": "session-two", "outcome": "failed" }
+  ]
+}
+```
+
+Outcomes are `archived`, `already_archived`, `skipped_cancelled`, `skipped_queued_work`,
+`not_found`, or `failed`. The batch is not atomic: successful targets remain archived even if
+another target fails. Retry only failed IDs; the endpoint does not scan or replay earlier targets.
+Use the existing session-list API to choose targets. A missing runtime is reported as `not_found`,
+without rewriting its index row. Runtime calls have bounded concurrency and share one batch deadline
+below the web proxy timeout. Unstarted or unfinished targets return `failed`; a timed-out mutation
+may still complete, and retrying it is safe.
+
+Both single and batch requests use the same runtime archive operation. The runtime checks current
+state before changing it, refuses cancelled sessions or queued work, and confirms index agreement
+before returning success. All lifecycle projections use the session's persisted monotonic status
+revision, independent of activity timestamps. Older deliveries cannot overwrite a newer status;
+identical retries are idempotent and preserve newer activity. A superseding transition, missing
+index row, or unavailable projection returns a retryable failure. Single-session callers receive
+HTTP 503 in that case; batch callers receive `failed` for that ID. Single-session success/error
+bodies retain their existing fields and include an additive `outcome` for successful or ineligible
+archive decisions.
+
+Deploy D1 migration `0077_session_status_revision.sql` before the worker update. Runtime schema
+migration 51 upgrades existing sessions lazily; their first projection claims the legacy index row.
+The web proxy bounds raw request bytes before parsing and preserves upstream retry/correlation
+headers.
+
+The former `/operator/sessions/archive` and `/internal/operator-archive` proposal is not exposed.
 
 ### GitHub App Token Flow
 

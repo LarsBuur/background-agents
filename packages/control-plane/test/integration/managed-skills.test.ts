@@ -8,7 +8,7 @@ import { EnvironmentStore } from "../../src/db/environments";
 import { resolveManagedSkills } from "../../src/session/skill-resolution";
 import { buildSkillRevision, hashSessionSkillManifest } from "../../src/skills/content-addressing";
 import { cleanD1Tables } from "./cleanup";
-import { initNamedSessionDO, seedSandboxAuthHash, serviceFetch } from "./helpers";
+import { initNamedSessionDO, seedSandboxAuthHash, serviceFetch, sqlDatabase } from "./helpers";
 
 const content = {
   description: "Managed deployment instructions",
@@ -115,6 +115,8 @@ describe("managed skills persistence and resolution", () => {
     const sessions = new SessionIndexStore(env.DB);
     const base = {
       title: null,
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       repoOwner: null,
       repoName: null,
       model: "anthropic/claude-haiku-4-5",
@@ -203,6 +205,8 @@ describe("managed skills persistence and resolution", () => {
     const createdAt = Date.now();
     await new SessionIndexStore(env.DB).create({
       id: "legacy-without-skills",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: null,
       repoName: null,
@@ -407,6 +411,8 @@ describe("managed skills persistence and resolution", () => {
     const sessions = new SessionIndexStore(env.DB);
     await sessions.create({
       id: "wide",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: null,
       repoName: null,
@@ -456,6 +462,8 @@ describe("managed skills persistence and resolution", () => {
     );
     await new SessionIndexStore(env.DB).create({
       id: "paged",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: null,
       repoName: null,
@@ -622,20 +630,23 @@ describe("managed skills persistence and resolution", () => {
     // not be created at all.
     const environments = new EnvironmentStore(env.DB);
     const ids = Array.from({ length: 101 }, (_, index) => `env_${String(index).padStart(3, "0")}`);
-    for (const id of ids) {
-      await environments.create(
-        {
+    // Seed in one batch. One EnvironmentStore.create() per environment is 101
+    // sequential D1 round-trips, each its own transaction, which starves past the
+    // 5s test budget when every other integration file is contending for the pool.
+    await sqlDatabase(env.DB).batch(
+      ids.map((id) =>
+        environments.bindEnvironmentInsert({
           id,
+          owner_team_id: null,
           name: id,
           description: null,
           prebuild_enabled: 0,
           channel_associations: null,
           created_at: 1,
           updated_at: 1,
-        },
-        []
-      );
-    }
+        })
+      )
+    );
 
     const skills = new SkillStore(env.DB);
     const skill = await skills.create(
@@ -695,6 +706,7 @@ describe("managed skills persistence and resolution", () => {
     await environments.create(
       {
         id: "env_skill_generation",
+        owner_team_id: null,
         name: "Before",
         description: null,
         prebuild_enabled: 0,

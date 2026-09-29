@@ -1,10 +1,15 @@
+import { getValidHarnessOrDefault } from "@open-inspect/shared/harnesses";
 import { childFollowUpPromptRequestSchema } from "@open-inspect/shared/types/session-api";
 import { isSessionPromptable } from "@open-inspect/shared/types/session-activity";
 import { z } from "zod";
 import { sessionStatusSchema } from "@open-inspect/shared/types/sessions";
 import { parsePersistedSandboxSettings } from "../../../sandbox/settings";
 import type { SessionMessenger } from "../../messenger";
-import { PromptQueueFullError, SessionNotPromptableError } from "../../message-queue";
+import {
+  PromptQueueFullError,
+  SandboxPromptBlockedError,
+  SessionNotPromptableError,
+} from "../../message-queue";
 import type { MessageRepository } from "../../message-repository";
 import type { ParticipantRepository } from "../../participant-repository";
 import type { SessionCoreRepository } from "../../session-core-repository";
@@ -78,8 +83,11 @@ export class ChildSessionsHandler {
     );
     if (promptAuthor instanceof Response) return promptAuthor;
     let sandboxTimeoutMs: number | undefined;
+    let finalSnapshotBufferMs: number | undefined;
     try {
-      sandboxTimeoutMs = parsePersistedSandboxSettings(session.sandbox_settings).sandboxTimeoutMs;
+      const sandboxSettings = parsePersistedSandboxSettings(session.sandbox_settings);
+      sandboxTimeoutMs = sandboxSettings.sandboxTimeoutMs;
+      finalSnapshotBufferMs = sandboxSettings.finalSnapshotBufferMs;
     } catch {
       sandboxTimeoutMs = undefined;
     }
@@ -87,10 +95,12 @@ export class ChildSessionsHandler {
       repoOwner: session.repo_owner,
       repoName: session.repo_name,
       repoId: session.repo_id,
+      harness: getValidHarnessOrDefault(session.harness),
       model: session.model,
       reasoningEffort: session.reasoning_effort ?? null,
       baseBranch: session.base_branch,
       sandboxTimeoutMs,
+      finalSnapshotBufferMs,
       promptAuthor: {
         userId: promptAuthor.user_id,
         ...(promptAuthor.canonical_user_id
@@ -100,9 +110,6 @@ export class ChildSessionsHandler {
         scmLogin: promptAuthor.scm_login,
         scmName: promptAuthor.scm_name,
         scmEmail: promptAuthor.scm_email,
-        scmAccessTokenEncrypted: promptAuthor.scm_access_token_encrypted,
-        scmRefreshTokenEncrypted: promptAuthor.scm_refresh_token_encrypted,
-        scmTokenExpiresAt: promptAuthor.scm_token_expires_at,
       },
     };
 
@@ -155,15 +162,18 @@ export class ChildSessionsHandler {
             login: parsed.data.author.scmLogin,
             name: parsed.data.author.scmName,
             email: parsed.data.author.scmEmail,
-            accessTokenEncrypted: null,
-            refreshTokenEncrypted: null,
-            tokenExpiresAt: null,
           },
         })
       );
     } catch (error) {
       if (error instanceof SessionNotPromptableError) {
         return Response.json({ error: error.message }, { status: 409 });
+      }
+      if (error instanceof SandboxPromptBlockedError) {
+        return Response.json(
+          { error: error.message, code: "SANDBOX_RECOVERY_REQUIRED" },
+          { status: 409 }
+        );
       }
       if (error instanceof PromptQueueFullError) {
         return Response.json({ error: "Child prompt queue is full" }, { status: 429 });

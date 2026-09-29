@@ -1,3 +1,7 @@
+import {
+  checkHarnessCompatibility,
+  getValidHarnessOrDefault,
+} from "@open-inspect/shared/harnesses";
 import { generateId, hashToken } from "../auth/crypto";
 import type { SessionIndexStore } from "../db/session-index";
 import type { Logger } from "../logger";
@@ -39,6 +43,7 @@ import { resolveParticipantName } from "./participant-name";
 import type { AlarmScheduler, BackgroundTasks, SessionWebSocket } from "../platform-ports";
 import type { ExecutionStopCoordinator } from "./execution-stop-coordinator";
 import type { MessageFailureService } from "./message-failure-service";
+import { sandboxBootPhaseLogFields } from "../sandbox/boot-phase";
 import { resolveGitAuthorIdentity } from "./identity";
 import { validateReasoningEffort } from "./reasoning-effort";
 import {
@@ -72,6 +77,13 @@ export class SessionNotPromptableError extends Error {
   }
 }
 
+export class SandboxPromptBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxPromptBlockedError";
+  }
+}
+
 export class BudgetExhaustedError extends Error {
   constructor() {
     super(
@@ -92,6 +104,14 @@ export class PromptRequestConflictError extends Error {
   constructor() {
     super("clientRequestId was already used for a different prompt");
     this.name = "PromptRequestConflictError";
+  }
+}
+
+/** A per-prompt model override the session's harness cannot run. */
+export class HarnessModelIncompatibleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HarnessModelIncompatibleError";
   }
 }
 
@@ -150,13 +170,16 @@ export class SessionMessageQueue {
     private readonly alarmScheduler: AlarmScheduler,
     private readonly executionStop: ExecutionStopCoordinator,
     /** Resolved per use so it honors settings persisted after construction. */
-    private readonly getExecutionTimeoutMs: () => number
+    private readonly getExecutionTimeoutMs: () => number,
+    private readonly mayDispatch: () => boolean,
+    private readonly getSandboxPromptBlockReason: () => string | null
   ) {}
 
   async enqueueAutofix(
     command: Extract<GitHubAutofixSessionCommand, { type: "enqueue_feedback" }>
   ): Promise<EnqueueAutofixResponse> {
     const session = this.repository.getSession();
+    const sandboxRecoveryRequired = this.getSandboxPromptBlockReason() !== null;
     const userId = `github:${command.author.id}`;
     const now = Date.now();
     const admission = this.messageRepository.admitAutofixMessage({
@@ -185,6 +208,7 @@ export class SessionMessageQueue {
       attemptLimit: command.attemptLimit,
       windowStart: now - AUTOFIX_ATTEMPT_WINDOW_MS,
       sessionClosed: !session || session.status === "archived" || session.status === "cancelled",
+      sandboxRecoveryRequired,
     });
     if (admission.kind === "rejected") return admission;
 
@@ -215,6 +239,7 @@ export class SessionMessageQueue {
 
     const session = this.repository.getSession();
     if (!session || session.status === "archived" || session.status === "cancelled") return;
+    if (this.getSandboxPromptBlockReason()) return;
 
     await this.sessionStatus.transition("active");
     await this.processMessageQueue();
@@ -228,6 +253,7 @@ export class SessionMessageQueue {
     let enqueued: EnqueuedPrompt;
     try {
       this.assertPromptableSession();
+      this.assertSandboxAcceptingPrompts();
       let participant = this.participantRepository.getParticipantById(client.participantId);
       participant ??= this.participantService.getByUserId(client.userId);
       if (!participant) {
@@ -264,6 +290,15 @@ export class SessionMessageQueue {
         });
         return;
       }
+      if (error instanceof SandboxPromptBlockedError) {
+        this.wsManager.send(ws, {
+          type: "error",
+          code: "SANDBOX_RECOVERY_REQUIRED",
+          message: error.message,
+          clientRequestId: data.clientRequestId,
+        });
+        return;
+      }
       if (error instanceof PromptQueueFullError) {
         this.wsManager.send(ws, {
           type: "error",
@@ -286,6 +321,15 @@ export class SessionMessageQueue {
         this.wsManager.send(ws, {
           type: "error",
           code: "BUDGET_EXHAUSTED",
+          message: error.message,
+          clientRequestId: data.clientRequestId,
+        });
+        return;
+      }
+      if (error instanceof HarnessModelIncompatibleError) {
+        this.wsManager.send(ws, {
+          type: "error",
+          code: "HARNESS_MODEL_INCOMPATIBLE",
           message: error.message,
           clientRequestId: data.clientRequestId,
         });
@@ -342,6 +386,7 @@ export class SessionMessageQueue {
   }
 
   async processMessageQueue(): Promise<void> {
+    if (!this.mayDispatch()) return;
     const currentSession = this.repository.getSession();
     if (!currentSession || !isSessionPromptable(currentSession.status)) {
       return;
@@ -371,7 +416,15 @@ export class SessionMessageQueue {
     const now = Date.now();
     const session = this.repository.getSession();
     const resolvedModel = getValidModelOrDefault(message.model || session?.model);
-    const authenticationError = await this.getProviderAuthenticationError(resolvedModel);
+    // The same rule as admission, applied at dispatch: the harness is fixed
+    // at create, so nothing may reach the sandbox on a model it cannot run.
+    const harnessIncompatibility = checkHarnessCompatibility(
+      getValidHarnessOrDefault(session?.harness),
+      resolvedModel
+    );
+    const authenticationError =
+      harnessIncompatibility?.message ?? (await this.getProviderAuthenticationError(resolvedModel));
+    if (!this.mayDispatch()) return;
     if (this.repository.getSession()?.budget_exhausted === 1) return;
     if (authenticationError) {
       this.log.error("provider_auth.unavailable", {
@@ -385,8 +438,21 @@ export class SessionMessageQueue {
       }
       return;
     }
-    const sandboxWs = this.wsManager.getSandboxSocket();
-    if (!sandboxWs) {
+    const target = this.wsManager.getSandboxCommandTarget();
+    if (target.kind === "booting") {
+      // A bridge is attached ahead of its boot. Nothing to spawn and nothing
+      // to send: the runtime's `ready` event pumps this queue when the
+      // harness is up, and the lifecycle alarms decide if the boot died.
+      this.log.info("prompt.dispatch", {
+        event: "prompt.dispatch",
+        message_id: message.id,
+        outcome: "deferred",
+        reason: "sandbox_booting",
+        ...sandboxBootPhaseLogFields(target.phase),
+      });
+      return;
+    }
+    if (target.kind === "unavailable") {
       // The provider-auth lookup above is a non-storage await. The socket
       // path re-validates through the processing claim; this path has no
       // claim, so it re-reads what it acts on: a cancel or archive that
@@ -437,6 +503,7 @@ export class SessionMessageQueue {
       return;
     }
 
+    const sandboxWs = target.socket;
     const author = this.participantRepository.getParticipantById(message.author_id);
     if (!author) {
       throw new Error(`Missing prompt author ${message.author_id}`);
@@ -474,6 +541,7 @@ export class SessionMessageQueue {
       ),
     };
 
+    if (!this.mayDispatch()) return;
     const claimed = this.messageRepository.startMessageProcessing(
       message.id,
       now,
@@ -495,6 +563,7 @@ export class SessionMessageQueue {
       this.messenger.broadcast({ type: "processing_status", isProcessing: true });
       this.broadcastPromptQueue();
       this.sandboxLifecycle.updateLastActivity(now);
+      this.sandboxLifecycle.onPromptDispatched();
 
       // Execution timeout shares the DO's single alarm slot with lifecycle checks.
       const deadline = now + this.getExecutionTimeoutMs();
@@ -544,6 +613,23 @@ export class SessionMessageQueue {
     this.broadcastPromptQueue();
     const sandboxWs = this.wsManager.getSandboxSocket();
     if (sandboxWs) this.wsManager.send(sandboxWs, { type: "stop" });
+  }
+
+  /**
+   * Fail one pending prompt, the one a sandbox boot that gave up was going to
+   * run. Named by id, not by queue position: the caller identified it before
+   * the lifecycle work that may have yielded, and a prompt cancelled or
+   * dispatched in the meantime is left alone. Later prompts stay pending and
+   * dispatch on the user's next spawn, the same way a failed turn leaves the
+   * queue today. Does not pump the queue — the caller has just failed the
+   * sandbox, and the next spawn is the user's to start.
+   */
+  async failPendingMessage(messageId: string, error: string): Promise<void> {
+    const message = this.messageRepository.getMessageById(messageId);
+    if (!message || message.status !== "pending") return;
+    if (!this.failMessage(message, error, Date.now(), "pending")) return;
+    this.broadcastPromptQueue();
+    await this.sessionStatus.reconcileAfterExecution(false);
   }
 
   /**
@@ -614,6 +700,7 @@ export class SessionMessageQueue {
     data: EnqueuePromptRequest
   ): Promise<{ messageId: string; status: "queued" }> {
     this.assertPromptableSession();
+    this.assertSandboxAcceptingPrompts();
     this.assertBudgetAvailable();
     this.assertQueueCapacity();
     let participant = this.participantService.getByUserId(data.authorId);
@@ -641,9 +728,6 @@ export class SessionMessageQueue {
         scmEmail: enrichment.email,
         scmLogin: enrichment.login,
         scmUserId: enrichment.userId,
-        scmAccessTokenEncrypted: enrichment.accessTokenEncrypted,
-        scmRefreshTokenEncrypted: enrichment.refreshTokenEncrypted,
-        scmTokenExpiresAt: enrichment.tokenExpiresAt,
       });
       participant = this.participantRepository.getParticipantById(participant.id) ?? participant;
     }
@@ -676,6 +760,7 @@ export class SessionMessageQueue {
     // cancel or archive can land while this request is suspended, so the
     // session is read after it, not before.
     this.assertPromptableSession();
+    this.assertSandboxAcceptingPrompts();
     const queueDepthBefore = this.messageRepository.getPendingOrProcessingCount();
     if (data.clientRequestId) {
       const existing = this.messageRepository.getMessageByClientRequestId(data.clientRequestId);
@@ -719,6 +804,11 @@ export class SessionMessageQueue {
     let messageModel: string | null = null;
     if (data.model) {
       if (isValidModel(data.model)) {
+        // An override the session's harness cannot run is a user-visible
+        // rejection, never a silent fallback to a model it can run.
+        const harness = getValidHarnessOrDefault(this.repository.getSession()?.harness);
+        const incompatibility = checkHarnessCompatibility(harness, data.model);
+        if (incompatibility) throw new HarnessModelIncompatibleError(incompatibility.message);
         messageModel = data.model;
       } else {
         this.log.warn("Invalid message model, ignoring override", { model: data.model });
@@ -809,6 +899,11 @@ export class SessionMessageQueue {
     if (session && !isSessionPromptable(session.status)) {
       throw new SessionNotPromptableError(session.status);
     }
+  }
+
+  private assertSandboxAcceptingPrompts(): void {
+    const reason = this.getSandboxPromptBlockReason();
+    if (reason) throw new SandboxPromptBlockedError(reason);
   }
 
   private assertQueueCapacity(

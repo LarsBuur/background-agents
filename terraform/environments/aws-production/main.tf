@@ -37,12 +37,14 @@ module "control_plane" {
   route53_zone_id = var.route53_zone_id
   secret_names    = var.secret_names
   alarm_topic_arn = var.alarm_topic_arn
+  github_deploy   = var.github_deploy
 
   config = merge({
     APP_NAME               = "Open-Inspect"
     LOG_LEVEL              = "info"
     SANDBOX_PROVIDER       = "modal"
     UNSAFE_ALLOW_ALL_USERS = "false"
+    TEAMS_ENFORCEMENT      = "shadow"
   }, var.config)
 
   tags = { Environment = local.environment }

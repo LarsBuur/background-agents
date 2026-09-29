@@ -1,6 +1,7 @@
 """Shared payload staging and conservative build invalidation."""
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -110,18 +111,19 @@ def test_runtime_assets_are_packed_without_per_file_manifest(checkout, tmp_path)
     skill = "packages/sandbox-runtime/src/sandbox_runtime/skills/agent-browser/SKILL.md"
     (checkout / skill).write_text("updated skill")
     packed = pack_bundle(checkout, "e2b", tmp_path / "bundles")
-    assert (packed / skill).read_text() == "updated skill"
-    config = json.loads((packed / "build-config.json").read_text())
+    assert (packed.directory / skill).read_text() == "updated skill"
+    config = json.loads((packed.directory / "build-config.json").read_text())
+    assert config == packed.plan
     assert set(config) == {"provider", "target", "runtimeVersion", "runtimeEnv", "buildHash"}
-    assert not (packed / "packages/e2b-infra").exists()
+    assert not (packed.directory / "packages/e2b-infra").exists()
 
 
 def test_each_caller_gets_a_fresh_context_without_reusing_extra_files(tmp_path):
     first = pack_bundle(REPO_ROOT, "e2b", tmp_path)
-    (first / ".env").write_text("must not leak")
+    (first.directory / ".env").write_text("must not leak")
     second = pack_bundle(REPO_ROOT, "e2b", tmp_path)
-    assert first != second
-    assert not (second / ".env").exists()
+    assert first.directory != second.directory
+    assert not (second.directory / ".env").exists()
 
 
 def test_missing_payload_fails_closed(checkout):
@@ -137,7 +139,7 @@ def test_symlinks_and_executable_modes(checkout, tmp_path):
     (directory / "probe-link.sh").symlink_to("probe.sh")
     before = plan_image(checkout, "e2b")["buildHash"]
     packed = pack_bundle(checkout, "e2b", tmp_path / "bundles")
-    copied = packed / "packages/sandbox-runtime/src/sandbox_runtime"
+    copied = packed.directory / "packages/sandbox-runtime/src/sandbox_runtime"
     assert (copied / "probe-link.sh").is_symlink()
     assert (copied / "probe.sh").stat().st_mode & 0o111
     (directory / "probe.sh").chmod(0o644)
@@ -145,3 +147,63 @@ def test_symlinks_and_executable_modes(checkout, tmp_path):
     (directory / "escape.sh").symlink_to(tmp_path / "outside")
     with pytest.raises(ValueError, match="symlink"):
         plan_image(checkout, "e2b")
+
+
+def test_docker_variant_pins_debian_packages_by_checksum():
+    tools = json.loads((REPO_ROOT / "packages/sandbox-images/toolchain.json").read_text())
+    assert set(tools["docker"]) == {"engine", "cli", "containerd", "buildx", "compose"}
+    tools["docker"]["engine"]["file"] = "docker-ce_latest.tgz"
+    with pytest.raises(ValueError, match="Debian amd64"):
+        validate_toolchain(tools)
+    tools = json.loads((REPO_ROOT / "packages/sandbox-images/toolchain.json").read_text())
+    tools["docker"]["compose"]["sha256"] = "deadbeef"
+    with pytest.raises(ValueError, match="SHA-256"):
+        validate_toolchain(tools)
+    del tools["docker"]["buildx"]
+    with pytest.raises(ValueError, match="exactly"):
+        validate_toolchain(tools)
+
+
+def test_docker_variant_installs_only_checked_packages_and_never_runs_at_boot():
+    script = (REPO_ROOT / "packages/sandbox-images/install/docker.sh").read_text()
+    assert "download_checked" in script
+    assert "get.docker.com" not in script
+    assert "docker pull" not in script
+    install_commands = [line for line in script.splitlines() if "apt-get install" in line]
+    assert install_commands
+    assert all("--no-install-recommends" in command for command in install_commands)
+    assert "/etc/docker/daemon.json" in script
+    # The default image's installer never includes the Docker phase.
+    install = (REPO_ROOT / "packages/sandbox-images/install/install.sh").read_text()
+    assert "docker" not in install
+
+
+def test_docker_daemon_config_uses_overlay2_and_avoids_modal_networks():
+    config = json.loads(
+        (REPO_ROOT / "packages/sandbox-images/install/docker-daemon.json").read_text()
+    )
+    assert config["storage-driver"] == "overlay2"
+    assert config["features"]["containerd-snapshotter"] is False
+    assert config["bip"].startswith("10.")
+    assert all(pool["base"].startswith("10.") for pool in config["default-address-pools"])
+
+
+def test_docker_pins_reach_the_installer_as_shell_variables(checkout, tmp_path):
+    bundle = pack_bundle(checkout, "modal", tmp_path / "out")
+    config = (bundle.directory / "image-config.sh").read_text()
+    for package in ("ENGINE", "CLI", "CONTAINERD", "BUILDX", "COMPOSE"):
+        assert f"export DOCKER_{package}_FILE=" in config
+        assert f"export DOCKER_{package}_SHA256=" in config
+
+
+def test_docker_daemon_shutdown_timeout_fits_inside_the_runtime_stop_deadline():
+    config = json.loads(
+        (REPO_ROOT / "packages/sandbox-images/install/docker-daemon.json").read_text()
+    )
+    runtime = (
+        REPO_ROOT / "packages/sandbox-runtime/src/sandbox_runtime/docker_service.py"
+    ).read_text()
+    stop_deadline = float(
+        re.search(r"^DOCKER_STOP_TIMEOUT_SECONDS = ([0-9.]+)", runtime, re.M).group(1)
+    )
+    assert config["shutdown-timeout"] < stop_deadline

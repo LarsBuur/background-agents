@@ -11,9 +11,11 @@
  */
 
 import type { AnalyticsPullRequestsResponse } from "@open-inspect/shared/types/analytics";
-import type { SpawnSource } from "@open-inspect/shared/types/sessions";
+import { getModelDisplayName, normalizeModelId } from "@open-inspect/shared/models";
+import { HARNESS_CATALOG, isValidHarness } from "@open-inspect/shared/harnesses";
 import type { SqlDatabase, SqlResult, SqlStatement } from "./sql-database";
 import { MS_PER_DAY, utcDateFromDayIndex } from "./utc-day";
+import { z } from "zod";
 
 /** `now` anchors the open-inventory age computation. */
 export interface PullRequestAnalyticsFilters {
@@ -22,46 +24,53 @@ export interface PullRequestAnalyticsFilters {
   now: number;
 }
 
-interface FunnelRow {
-  created: number;
-  open: number;
-  draft: number;
-  merged: number;
-  closed: number;
-}
+const funnelRowSchema = z.object({
+  created: z.number(),
+  open: z.number(),
+  draft: z.number(),
+  merged: z.number(),
+  closed: z.number(),
+});
 
-interface CostRow {
-  cost: number;
-}
+const costRowSchema = z.object({
+  cost: z.number(),
+});
 
-interface MergeRow {
-  merged: number;
-  avg_time_to_merge_ms: number | null;
-}
+const mergeRowSchema = z.object({
+  merged: z.number(),
+  avg_time_to_merge_ms: z.number().nullable(),
+});
 
-interface InventoryRow {
-  total: number;
-  avg_age_ms: number | null;
-}
+const inventoryRowSchema = z.object({
+  total: z.number(),
+  avg_age_ms: z.number().nullable(),
+});
 
-interface DailyCountRow {
-  day_index: number;
-  count: number;
-}
+const dailyCountRowSchema = z.object({
+  day_index: z.number(),
+  count: z.number(),
+});
 
-interface RepoRow {
-  key: string;
-  created: number;
-  merged: number;
-  closed: number;
-  avg_time_to_merge_ms: number | null;
-}
+const repoRowSchema = z.object({
+  key: z.string(),
+  created: z.number(),
+  merged: z.number(),
+  closed: z.number(),
+  avg_time_to_merge_ms: z.number().nullable(),
+});
 
-interface SourceRow {
-  source: SpawnSource;
-  created: number;
-  merged: number;
-}
+const sourceRowSchema = z.object({
+  source: z.enum(["user", "agent", "automation", "github-bot", "linear-bot", "slack-bot"]),
+  created: z.number(),
+  merged: z.number(),
+});
+
+const dimensionRowSchema = z.object({
+  key: z.string(),
+  created: z.number(),
+  merged: z.number(),
+  session_cost: z.number(),
+});
 
 /**
  * When a PR entered the world, for windowing and cycle time. The row's own
@@ -72,14 +81,6 @@ interface SourceRow {
 function prCreatedAtExpr(alias = ""): string {
   const prefix = alias ? `${alias}.` : "";
   return `COALESCE(${prefix}provider_created_at, ${prefix}created_at)`;
-}
-
-function rows<T>(result: SqlResult): T[] {
-  return (result.results ?? []) as T[];
-}
-
-function firstRow<T>(result: SqlResult): T | undefined {
-  return rows<T>(result)[0];
 }
 
 export class PullRequestAnalyticsStore {
@@ -105,7 +106,7 @@ export class PullRequestAnalyticsStore {
     const cohortWindow = `${prCreatedAt} >= ? AND ${prCreatedAt} < ?`;
     const cohortBinds = [filters.startAt, filters.endAt];
 
-    return [
+    const statements = [
       this.db
         .prepare(
           `SELECT
@@ -192,6 +193,30 @@ export class PullRequestAnalyticsStore {
         )
         .bind(...cohortBinds),
     ];
+    for (const dimension of ["model", "harness"] as const) {
+      statements.push(
+        this.db
+          .prepare(
+            `SELECT s.${dimension} AS key,
+                    COUNT(*) AS created,
+                    COALESCE(SUM(CASE WHEN p.lifecycle_state = 'merged' THEN 1 ELSE 0 END), 0) AS merged,
+                    (SELECT COALESCE(SUM(x.total_cost), 0)
+                     FROM sessions x
+                     WHERE x.${dimension} = s.${dimension}
+                       AND x.id IN (
+                         SELECT DISTINCT cost_p.session_id FROM session_pull_requests cost_p
+                         WHERE ${prCreatedAtExpr("cost_p")} >= ? AND ${prCreatedAtExpr("cost_p")} < ?
+                       )) AS session_cost
+             FROM session_pull_requests p
+             JOIN sessions s ON p.session_id = s.id
+             WHERE ${prCreatedAtExpr("p")} >= ? AND ${prCreatedAtExpr("p")} < ?
+             GROUP BY s.${dimension}
+             ORDER BY session_cost DESC, key ASC`
+          )
+          .bind(...cohortBinds, ...cohortBinds)
+      );
+    }
+    return statements;
   }
 
   decode(results: SqlResult[]): AnalyticsPullRequestsResponse {
@@ -204,23 +229,48 @@ export class PullRequestAnalyticsStore {
       mergedResult,
       reposResult,
       sourcesResult,
+      modelsResult,
+      harnessesResult,
     ] = results;
 
-    const funnel = firstRow<FunnelRow>(funnelResult);
-    const cost = firstRow<CostRow>(costResult);
-    const merges = firstRow<MergeRow>(mergesResult);
-    const inventory = firstRow<InventoryRow>(inventoryResult);
+    const funnel = parseOptionalRow(funnelResult.results?.[0], funnelRowSchema, "PR funnel row");
+    const cost = parseOptionalRow(costResult.results?.[0], costRowSchema, "PR cost row");
+    const merges = parseOptionalRow(mergesResult.results?.[0], mergeRowSchema, "PR merge row");
+    const inventory = parseOptionalRow(
+      inventoryResult.results?.[0],
+      inventoryRowSchema,
+      "PR inventory row"
+    );
 
     const timeseries = new Map<number, { created: number; merged: number }>();
-    for (const row of rows<DailyCountRow>(createdResult)) {
+    for (const row of parseRows(createdResult.results, dailyCountRowSchema, "PR created row")) {
       timeseries.set(row.day_index, { created: row.count, merged: 0 });
     }
-    for (const row of rows<DailyCountRow>(mergedResult)) {
+    for (const row of parseRows(mergedResult.results, dailyCountRowSchema, "PR merged row")) {
       const point = timeseries.get(row.day_index);
       if (point) {
         point.merged = row.count;
       } else {
         timeseries.set(row.day_index, { created: 0, merged: row.count });
+      }
+    }
+
+    const models = new Map<string, AnalyticsPullRequestsResponse["models"][number]>();
+    for (const row of parseRows(modelsResult.results, dimensionRowSchema, "PR model row")) {
+      const key = normalizeModelId(row.key);
+      const previous = models.get(key);
+      if (previous) {
+        previous.created += row.created;
+        previous.merged += row.merged;
+        previous.sessionCost += row.session_cost;
+      } else {
+        models.set(key, {
+          key,
+          displayName: getModelDisplayName(key),
+          created: row.created,
+          merged: row.merged,
+          sessionCost: row.session_cost,
+        });
       }
     }
 
@@ -242,18 +292,53 @@ export class PullRequestAnalyticsStore {
       timeseries: Array.from(timeseries.entries())
         .sort(([a], [b]) => a - b)
         .map(([dayIndex, counts]) => ({ date: utcDateFromDayIndex(dayIndex), ...counts })),
-      repos: rows<RepoRow>(reposResult).map((row) => ({
+      repos: parseRows(reposResult.results, repoRowSchema, "PR repo row").map((row) => ({
         key: row.key,
         created: row.created,
         merged: row.merged,
         closed: row.closed,
         avgTimeToMergeMs: row.avg_time_to_merge_ms,
       })),
-      sources: rows<SourceRow>(sourcesResult).map((row) => ({
+      sources: parseRows(sourcesResult.results, sourceRowSchema, "PR source row").map((row) => ({
         source: row.source,
         created: row.created,
         merged: row.merged,
       })),
+      models: [...models.values()].sort(
+        (a, b) => b.sessionCost - a.sessionCost || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+      ),
+      harnesses: parseRows(harnessesResult.results, dimensionRowSchema, "PR harness row").map(
+        (row) => ({
+          key: row.key,
+          displayName: isValidHarness(row.key) ? HARNESS_CATALOG[row.key].label : row.key,
+          created: row.created,
+          merged: row.merged,
+          sessionCost: row.session_cost,
+        })
+      ),
     };
   }
+}
+
+function parseOptionalRow<Schema extends z.ZodType>(
+  row: unknown,
+  schema: Schema,
+  name: string
+): z.infer<Schema> | undefined {
+  if (row === undefined) return undefined;
+  const parsed = schema.safeParse(row);
+  if (!parsed.success) throw new Error(`Invalid ${name}`);
+  return parsed.data;
+}
+
+function parseRows<Schema extends z.ZodType>(
+  rows: unknown[] | undefined,
+  schema: Schema,
+  name: string
+): Array<z.infer<Schema>> {
+  return (rows ?? []).map((row) => {
+    const parsed = schema.safeParse(row);
+    if (!parsed.success) throw new Error(`Invalid ${name}`);
+    return parsed.data;
+  });
 }

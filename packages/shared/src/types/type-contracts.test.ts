@@ -1,6 +1,9 @@
 import type { z } from "zod";
 import { expectTypeOf, it } from "vitest";
+import type { ANALYTICS_RUN_ORDER_BY } from ".";
 import type {
+  AnalyticsRunOrderBy,
+  AnalyticsRunsResponse,
   AutomationTriggerType,
   ConditionConfigMap,
   ConditionType,
@@ -16,14 +19,25 @@ import type {
   CreateAutomationRequest,
   CreateEnvironmentInput,
   ListAutomationsResponse,
+  ChildSessionListResponse,
   ModelProviderSelections,
   RepositoryInput,
   ServerMessage,
+  SessionRun,
+  SessionListRepository,
+  SessionListResponse,
+  SessionListSummary,
+  SessionSummaryBase,
   UpdateAutomationRequest,
   UpdateEnvironmentInput,
   createEnvironmentInputSchema,
+  childSessionListResponseSchema,
   createAutomationRequestSchema,
   repositoryInputSchema,
+  sessionListRepositorySchema,
+  sessionListResponseSchema,
+  sessionListSummarySchema,
+  sessionSummaryBaseSchema,
   serverMessageSchema,
   updateEnvironmentInputSchema,
   updateAutomationRequestSchema,
@@ -32,6 +46,17 @@ import type {
 } from ".";
 import type { SandboxEvent, sandboxEventSchema } from "./sandbox-events";
 import type {
+  SessionInboxItem,
+  SessionInboxPage,
+  SessionInboxSession,
+  SessionInboxSnapshot,
+  SessionListItem,
+  sessionInboxItemSchema,
+  sessionInboxPageSchema,
+  sessionInboxSessionSchema,
+  sessionInboxSnapshotSchema,
+} from "./session-inbox";
+import type {
   CreateSessionInput,
   CreateSessionRequest,
   createSessionInputSchema,
@@ -39,6 +64,8 @@ import type {
 } from "./session-api";
 
 it("preserves public Zod input and output relationships", () => {
+  expectTypeOf<AnalyticsRunOrderBy>().toEqualTypeOf<(typeof ANALYTICS_RUN_ORDER_BY)[number]>();
+  expectTypeOf<AnalyticsRunsResponse["runs"][number]>().toEqualTypeOf<SessionRun>();
   expectTypeOf<RepositoryInput>().toEqualTypeOf<z.input<typeof repositoryInputSchema>>();
   expectTypeOf<CreateEnvironmentInput>().toEqualTypeOf<
     z.input<typeof createEnvironmentInputSchema>
@@ -64,6 +91,20 @@ it("preserves public Zod input and output relationships", () => {
   expectTypeOf<ListAutomationsResponse>().toEqualTypeOf<
     z.output<typeof listAutomationsResponseSchema>
   >();
+  expectTypeOf<SessionListRepository>().toEqualTypeOf<
+    z.output<typeof sessionListRepositorySchema>
+  >();
+  expectTypeOf<SessionSummaryBase>().toEqualTypeOf<z.output<typeof sessionSummaryBaseSchema>>();
+  expectTypeOf<SessionListSummary>().toEqualTypeOf<z.output<typeof sessionListSummarySchema>>();
+  expectTypeOf<SessionListResponse>().toEqualTypeOf<z.output<typeof sessionListResponseSchema>>();
+  expectTypeOf<ChildSessionListResponse>().toEqualTypeOf<
+    z.output<typeof childSessionListResponseSchema>
+  >();
+  expectTypeOf<SessionInboxSession>().toEqualTypeOf<z.output<typeof sessionInboxSessionSchema>>();
+  expectTypeOf<SessionListItem>().toEqualTypeOf<SessionInboxSession>();
+  expectTypeOf<SessionInboxItem>().toEqualTypeOf<z.output<typeof sessionInboxItemSchema>>();
+  expectTypeOf<SessionInboxPage>().toEqualTypeOf<z.output<typeof sessionInboxPageSchema>>();
+  expectTypeOf<SessionInboxSnapshot>().toEqualTypeOf<z.output<typeof sessionInboxSnapshotSchema>>();
 });
 
 it("preserves the repository transform boundary", () => {

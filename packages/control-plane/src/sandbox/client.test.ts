@@ -42,6 +42,14 @@ describe("buildModalWorkspaceSlug", () => {
 });
 
 describe("buildModalSandboxDashboardUrl", () => {
+  it("returns null for a pending VM reference", () => {
+    expect(
+      buildModalSandboxDashboardUrl({
+        workspace: "acme",
+        providerObjectId: 'modal-vm-session:["session","sandbox"]',
+      })
+    ).toBeNull();
+  });
   it("builds a Modal dashboard URL for a sandbox object", () => {
     expect(
       buildModalSandboxDashboardUrl({
@@ -129,6 +137,87 @@ describe("ModalClient", () => {
     });
   });
 
+  it("resolves a VM using only generation identity and preserves typed errors", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        Response.json({
+          success: true,
+          data: {
+            sandbox_id: "generation",
+            modal_object_id: "sb-real",
+            sandbox_backend: "modal-vm",
+            code_server_url: "https://editor.example",
+            code_server_password: "password",
+          },
+        })
+      )
+      .mockResolvedValueOnce(Response.json({ detail: "not_visible" }, { status: 409 }));
+    const client = createModalClient("secret", "acme");
+    expect(
+      await client.resolveVmSandbox({ sessionId: "session", sandboxId: "generation" })
+    ).toMatchObject({
+      sandboxId: "generation",
+      modalObjectId: "sb-real",
+      codeServerPassword: "password",
+    });
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      "https://acme--open-inspect-api-resolve-vm-sandbox.modal.run"
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      session_id: "session",
+      sandbox_id: "generation",
+    });
+    await expect(
+      client.resolveVmSandbox({ sessionId: "session", sandboxId: "generation" })
+    ).rejects.toMatchObject({
+      status: 409,
+      detail: "not_visible",
+    });
+  });
+
+  it.each([
+    ["server error", Response.json({ detail: "Internal server error" }, { status: 500 })],
+    ["invalid success", Response.json({ success: true, data: {} })],
+    ["truncated success", new Response("{", { status: 200 })],
+  ])("types a VM startup %s as an unknown outcome after dispatch", async (_case, response) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    const client = createModalClient("secret", "acme");
+    await expect(
+      client.createSandbox({
+        sessionId: "session",
+        sandboxId: "generation",
+        sandboxBackend: "modal-vm",
+        repoOwner: null,
+        repoName: null,
+        controlPlaneUrl: "https://control.test",
+        sandboxAuthToken: "token",
+        harness: "opencode",
+      })
+    ).rejects.toMatchObject({ name: "ModalVmStartupError", outcome: "unknown" });
+  });
+
+  it("types a VM launch-window rejection without treating it as unknown", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ detail: "window_closed" }, { status: 409 })
+    );
+    await expect(
+      createModalClient("secret", "acme").restoreSandbox({
+        snapshotImageId: "image",
+        sessionId: "session",
+        sandboxId: "generation",
+        sandboxBackend: "modal-vm",
+        sandboxAuthToken: "token",
+        controlPlaneUrl: "https://control.test",
+        repoOwner: null,
+        repoName: null,
+        harness: "opencode",
+        provider: "anthropic",
+        model: "test",
+      })
+    ).rejects.toMatchObject({ name: "ModalVmStartupError", outcome: "window_closed" });
+  });
+
   it("times out image-build creation when response headers stall", async () => {
     vi.useFakeTimers();
     let markFetchStarted!: () => void;
@@ -204,6 +293,114 @@ describe("ModalClient", () => {
     expect(providerSignal.reason).toBe(callerReason);
   });
 
+  it("uses HTTP status handling before response schema validation", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: false, error: "provider unavailable" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    const client = createModalClient("secret", "acme", "prod-web");
+    await expect(
+      client.snapshotSandbox({
+        providerObjectId: "mo-1",
+        sessionId: "session-123",
+      })
+    ).rejects.toMatchObject({
+      name: "ModalApiError",
+      status: 503,
+      message: 'Modal API error: 503 {"success":false,"error":"provider unavailable"}',
+    });
+  });
+
+  it("extracts FastAPI error detail without matching message text", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ detail: "pending_reference_not_visible" }, { status: 409 })
+    );
+    const client = createModalClient("secret", "acme", "prod-web");
+    await expect(
+      client.stopSandbox({ providerObjectId: "sb-1", sessionId: "session-1" })
+    ).rejects.toMatchObject({
+      name: "ModalApiError",
+      status: 409,
+      detail: "pending_reference_not_visible",
+    });
+  });
+
+  it.each([
+    {
+      endpoint: "create sandbox",
+      call: (client: ReturnType<typeof createModalClient>) =>
+        client.createSandbox({
+          sessionId: "session-123",
+          repoOwner: null,
+          repoName: null,
+          controlPlaneUrl: "https://control-plane.test",
+          sandboxAuthToken: "auth-token",
+          harness: "opencode",
+        }),
+    },
+    {
+      endpoint: "restore sandbox",
+      call: (client: ReturnType<typeof createModalClient>) =>
+        client.restoreSandbox({
+          snapshotImageId: "img-1",
+          sessionId: "session-123",
+          sandboxId: "sandbox-456",
+          sandboxAuthToken: "auth-token",
+          controlPlaneUrl: "https://control-plane.test",
+          repoOwner: null,
+          repoName: null,
+          harness: "opencode",
+          provider: "anthropic",
+          model: "anthropic/claude-sonnet-4-5",
+        }),
+    },
+    {
+      endpoint: "snapshot sandbox",
+      call: (client: ReturnType<typeof createModalClient>) =>
+        client.snapshotSandbox({
+          providerObjectId: "mo-1",
+          sessionId: "session-123",
+        }),
+    },
+    {
+      endpoint: "create image-build sandbox",
+      call: (client: ReturnType<typeof createModalClient>) =>
+        client.createImageBuildSandbox({
+          scopeKind: "repo",
+          scopeId: "acme/repo",
+          buildId: "imgb-1",
+          repositories: [{ repoOwner: "acme", repoName: "repo", baseBranch: "main" }],
+          callbackUrl: "https://cp.test/image-builds/build-complete",
+          failureCallbackUrl: "https://cp.test/image-builds/build-failed",
+          buildExecutionTimeoutSeconds: 1800,
+          providerSessionTimeoutSeconds: 2400,
+        }),
+    },
+    {
+      endpoint: "start image-build sandbox",
+      call: (client: ReturnType<typeof createModalClient>) =>
+        client.startImageBuildSandbox({
+          buildId: "imgb-1",
+          providerSessionId: "modal-session-1",
+          callbackToken: "callback-token",
+        }),
+    },
+  ])("rejects HTTP 200 failure bodies for $endpoint", async ({ call }) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: false, error: "provider failure" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    await expect(call(createModalClient("secret", "acme", "prod-web"))).rejects.toThrow(
+      "Modal API error: Invalid response"
+    );
+  });
+
   it("routes the restore session_config through buildSessionConfig (carries mcp_servers)", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ success: true, data: { sandbox_id: "sb-1" } }), {
@@ -218,6 +415,7 @@ describe("ModalClient", () => {
       sessionId: "session-123",
       sandboxId: "sandbox-456",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
       controlPlaneUrl: "https://control-plane.test",
       repoOwner: "testowner",
       repoName: "testrepo",
@@ -229,12 +427,40 @@ describe("ModalClient", () => {
     const body = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
     expect(body.session_config).toEqual({
       session_id: "session-123",
+      harness: "opencode",
       repo_owner: "testowner",
       repo_name: "testrepo",
       provider: "anthropic",
       model: "anthropic/claude-sonnet-4-5",
       mcp_servers: [{ id: "mcp-1", name: "Tool", type: "local", enabled: true }],
+      bridge_early_connect: true,
     });
+  });
+
+  it("asks Modal's create handler for early bridge connect by SessionConfig field name", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: { sandbox_id: "sb-1", status: "spawning", created_at: 1 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const client = createModalClient("secret", "acme", "prod-web");
+    await client.createSandbox({
+      sessionId: "session-123",
+      sandboxId: "sandbox-456",
+      repoOwner: "testowner",
+      repoName: "testrepo",
+      controlPlaneUrl: "https://control-plane.test",
+      sandboxAuthToken: "auth-token",
+      harness: "opencode",
+    });
+
+    const body = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(body.bridge_early_connect).toBe(true);
   });
 
   it("sends multi-repo members as flat snake_case create fields", async () => {
@@ -258,6 +484,7 @@ describe("ModalClient", () => {
       repoName: "testrepo",
       controlPlaneUrl: "https://control-plane.test",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
       repositories: [
         { repoOwner: "testowner", repoName: "testrepo", baseBranch: "main" },
         { repoOwner: "testowner", repoName: "backend", baseBranch: "develop" },
@@ -289,10 +516,46 @@ describe("ModalClient", () => {
       repoName: "testrepo",
       controlPlaneUrl: "https://control-plane.test",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
     });
 
     const body = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
     expect(body.repositories).toBeNull();
+  });
+
+  it("passes the VM launch deadline to both create and restore endpoints", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        Response.json({ success: true, data: { sandbox_id: "sb-1", created_at: 1 } })
+      )
+      .mockResolvedValueOnce(Response.json({ success: true, data: { sandbox_id: "sb-2" } }));
+    const client = createModalClient("secret", "acme", "prod-web");
+    await client.createSandbox({
+      sessionId: "session-1",
+      repoOwner: null,
+      repoName: null,
+      controlPlaneUrl: "https://control-plane.test",
+      sandboxAuthToken: "token",
+      harness: "opencode",
+      launchDeadlineAtMs: 123456,
+    });
+    await client.restoreSandbox({
+      snapshotImageId: "im-1",
+      sessionId: "session-1",
+      sandboxId: "sandbox-1",
+      sandboxAuthToken: "token",
+      controlPlaneUrl: "https://control-plane.test",
+      repoOwner: null,
+      repoName: null,
+      harness: "opencode",
+      provider: "anthropic",
+      model: "model",
+      launchDeadlineAtMs: 123456,
+    });
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(JSON.parse(init!.body as string).launch_deadline_at_ms).toBe(123456);
+    }
   });
 
   it("parses optional create response fields without rejecting valid Modal data", async () => {
@@ -325,6 +588,7 @@ describe("ModalClient", () => {
         repoName: "testrepo",
         controlPlaneUrl: "https://control-plane.test",
         sandboxAuthToken: "auth-token",
+        harness: "opencode" as const,
       })
     ).resolves.toEqual({
       sandboxId: "sb-1",
@@ -368,6 +632,7 @@ describe("ModalClient", () => {
       repoName: "testrepo",
       controlPlaneUrl: "https://control-plane.test",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
     });
 
     expect(result).toEqual({
@@ -402,6 +667,7 @@ describe("ModalClient", () => {
         repoName: "testrepo",
         controlPlaneUrl: "https://control-plane.test",
         sandboxAuthToken: "auth-token",
+        harness: "opencode" as const,
       })
     ).rejects.toThrow("Modal API error: Invalid response");
   });
@@ -420,6 +686,7 @@ describe("ModalClient", () => {
       sessionId: "session-123",
       sandboxId: "sandbox-456",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
       controlPlaneUrl: "https://control-plane.test",
       repoOwner: "testowner",
       repoName: "testrepo",
@@ -438,9 +705,14 @@ describe("ModalClient", () => {
     ]);
   });
 
-  it("rejects malformed restore responses instead of trusting the payload", async () => {
+  it.each([
+    { success: true },
+    { success: true, data: {} },
+    { success: true, data: { sandbox_id: "" } },
+    { success: true, data: { sandbox_id: 123 } },
+  ])("rejects incomplete restore responses instead of trusting the payload", async (body) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ success: true, data: { sandbox_id: 123 } }), {
+      new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       })
@@ -453,6 +725,7 @@ describe("ModalClient", () => {
         sessionId: "session-123",
         sandboxId: "sandbox-456",
         sandboxAuthToken: "auth-token",
+        harness: "opencode" as const,
         controlPlaneUrl: "https://control-plane.test",
         repoOwner: "testowner",
         repoName: "testrepo",
@@ -490,6 +763,7 @@ describe("ModalClient", () => {
         sessionId: "session-123",
         sandboxId: "sandbox-456",
         sandboxAuthToken: "auth-token",
+        harness: "opencode" as const,
         controlPlaneUrl: "https://control-plane.test",
         repoOwner: "testowner",
         repoName: "testrepo",
@@ -497,7 +771,6 @@ describe("ModalClient", () => {
         model: "anthropic/claude-sonnet-4-5",
       })
     ).resolves.toEqual({
-      success: true,
       sandboxId: "sb-1",
       modalObjectId: undefined,
       codeServerUrl: undefined,
@@ -528,6 +801,7 @@ describe("ModalClient", () => {
       repoName: null,
       controlPlaneUrl: "https://control-plane.test",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
       vncEnabled: true,
     });
     await client.restoreSandbox({
@@ -535,6 +809,7 @@ describe("ModalClient", () => {
       sessionId: "session-123",
       sandboxId: "sandbox-456",
       sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
       controlPlaneUrl: "https://control-plane.test",
       repoOwner: null,
       repoName: null,
@@ -561,8 +836,28 @@ describe("ModalClient", () => {
         providerObjectId: "mo-1",
         sessionId: "session-123",
       })
-    ).resolves.toEqual({ success: true, imageId: "img-1" });
+    ).resolves.toEqual({ imageId: "img-1" });
   });
+
+  it.each([{ success: true }, { success: true, data: { image_id: "" } }])(
+    "rejects incomplete snapshot responses instead of synthesizing failures",
+    async (body) => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = createModalClient("secret", "acme", "prod-web");
+      await expect(
+        client.snapshotSandbox({
+          providerObjectId: "mo-1",
+          sessionId: "session-123",
+        })
+      ).rejects.toThrow("Modal API error: Invalid response");
+    }
+  );
 
   it("snapshots image builds through the identity-bound build endpoint", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -578,7 +873,7 @@ describe("ModalClient", () => {
         buildId: "imgb-1",
         providerSessionId: "mo-build-1",
       })
-    ).resolves.toEqual({ success: true, imageId: "img-build-1" });
+    ).resolves.toEqual({ imageId: "img-build-1" });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "https://acme-prod-web--open-inspect-api-snapshot-build-sandbox.modal.run",

@@ -36,21 +36,25 @@ describe("session provider auth persistence", () => {
     });
     await defaults.set("openai", FIRST_ACCOUNT_ID, "provider_account", null, 30);
 
-    const providerAuth = await resolveSessionProviderAuth(env.DB, { unattended: false });
+    const providerAuth = await resolveSessionProviderAuth(env.DB, {
+      unattended: false,
+      harness: "opencode",
+    });
     const sessionId = `provider-auth-${Date.now()}`;
     await initializeSession(
       createCloudflareEnv(env),
       {
         sessionId,
+        ownerTeamId: null,
+        visibility: "workspace",
         repoOwner: null,
         repoName: null,
         repoId: null,
+        harness: "opencode",
         model: "anthropic/claude-haiku-4-5",
         reasoningEffort: null,
         participantUserId: "user-1",
         platformUserId: null,
-        scmTokenEncrypted: null,
-        scmRefreshTokenEncrypted: null,
         managedSkillsManifest: {
           selection: { mode: "all" },
           resolverVersion: 1,
@@ -72,6 +76,7 @@ describe("session provider auth persistence", () => {
 
     await expect(new SessionIndexStore(env.DB).getCompleteProviderAuth(sessionId)).resolves.toEqual(
       [
+        { provider: "anthropic", authMode: "api_key", selectionSource: "api_key_fallback" },
         {
           provider: "openai",
           authMode: "provider_account",

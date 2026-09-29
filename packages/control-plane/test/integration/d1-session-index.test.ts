@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:test";
 import { SessionIndexStore } from "../../src/db/session-index";
+import { SessionStatusProjectionStore } from "../../src/db/session-status-projection-store";
 import { SessionPullRequestStore } from "../../src/db/session-pull-request-store";
 import type { SessionStatus } from "@open-inspect/shared/types/sessions";
 import { cleanD1Tables } from "./cleanup";
@@ -14,6 +15,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "test-session-1",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: "Test Session",
       repoOwner: "acme",
       repoName: "web-app",
@@ -40,6 +43,11 @@ describe("D1 SessionIndexStore", () => {
     const now = Date.now();
     const providerAuth = [
       {
+        provider: "anthropic" as const,
+        authMode: "api_key" as const,
+        selectionSource: "api_key_fallback",
+      },
+      {
         provider: "openai" as const,
         authMode: "api_key" as const,
         selectionSource: "fallback_api_key",
@@ -53,6 +61,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-provider-auth",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: null,
       repoName: null,
@@ -71,6 +81,15 @@ describe("D1 SessionIndexStore", () => {
       .bind("session-provider-auth")
       .all();
     expect(authRows.results).toEqual([
+      {
+        session_id: "session-provider-auth",
+        provider: "anthropic",
+        auth_mode: "api_key",
+        provider_account_id: null,
+        selection_source: "api_key_fallback",
+        inherited_from_session_id: null,
+        created_at: now,
+      },
       {
         session_id: "session-provider-auth",
         provider: "openai",
@@ -94,10 +113,13 @@ describe("D1 SessionIndexStore", () => {
       providerAuth
     );
     await expect(store.getProviderAuthForProvider("session-provider-auth", "xai")).resolves.toEqual(
-      providerAuth[1]
+      providerAuth[2]
     );
     await expect(
       store.getProviderAuthForProvider("session-provider-auth", "openai")
+    ).resolves.toEqual(providerAuth[1]);
+    await expect(
+      store.getProviderAuthForProvider("session-provider-auth", "anthropic")
     ).resolves.toEqual(providerAuth[0]);
     await expect(store.getCompleteProviderAuth("missing-session")).rejects.toThrow(/incomplete/);
   });
@@ -108,6 +130,8 @@ describe("D1 SessionIndexStore", () => {
     const create = (id: string, status: "active" | "completed") =>
       store.create({
         id,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: null,
         repoOwner: "acme",
         repoName: "repo",
@@ -138,6 +162,8 @@ describe("D1 SessionIndexStore", () => {
     const now = Date.now();
     await store.create({
       id: "parent",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "repo",
@@ -163,6 +189,8 @@ describe("D1 SessionIndexStore", () => {
     const now = Date.now();
     await store.create({
       id: "parent",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "repo",
@@ -194,6 +222,8 @@ describe("D1 SessionIndexStore", () => {
 
       await store.create({
         id: "assoc-session-1",
+        ownerTeamId: null,
+        visibility: "workspace",
         title: null,
         repoOwner: "Acme",
         repoName: "Web-App",
@@ -223,6 +253,8 @@ describe("D1 SessionIndexStore", () => {
 
       await store.create({
         id: "assoc-session-2",
+        ownerTeamId: null,
+        visibility: "workspace",
         title: null,
         repoOwner: "acme",
         repoName: "solo",
@@ -250,6 +282,8 @@ describe("D1 SessionIndexStore", () => {
     ] as const) {
       await store.create({
         id,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: null,
         repoOwner: "acme",
         repoName: "web-app",
@@ -311,6 +345,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-active-1",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -324,6 +360,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-completed-1",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -349,6 +387,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-with-effort",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -374,6 +414,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-no-effort",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -395,6 +437,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-with-login",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -418,6 +462,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-no-login",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -440,6 +486,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-metrics",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -457,6 +505,13 @@ describe("D1 SessionIndexStore", () => {
     expect(before!.activeDurationMs).toBe(0);
     expect(before!.messageCount).toBe(0);
     expect(before!.prCount).toBe(0);
+    expect(before).toMatchObject({
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
 
     // Update metrics
     const updated = await store.updateMetrics("session-metrics", {
@@ -464,6 +519,11 @@ describe("D1 SessionIndexStore", () => {
       activeDurationMs: 120000,
       messageCount: 5,
       prCount: 1,
+      inputTokens: 1200,
+      outputTokens: 340,
+      reasoningTokens: 56,
+      cacheReadTokens: 7800,
+      cacheWriteTokens: 910,
     });
     expect(updated).toBe(true);
 
@@ -473,6 +533,13 @@ describe("D1 SessionIndexStore", () => {
     expect(after!.activeDurationMs).toBe(120000);
     expect(after!.messageCount).toBe(5);
     expect(after!.prCount).toBe(1);
+    expect(after).toMatchObject({
+      inputTokens: 1200,
+      outputTokens: 340,
+      reasoningTokens: 56,
+      cacheReadTokens: 7800,
+      cacheWriteTokens: 910,
+    });
   });
 
   it("updateMetrics overwrites on repeated calls (last write wins)", async () => {
@@ -481,6 +548,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-metrics-overwrite",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "api",
@@ -497,6 +566,11 @@ describe("D1 SessionIndexStore", () => {
       activeDurationMs: 60000,
       messageCount: 3,
       prCount: 0,
+      inputTokens: 100,
+      outputTokens: 20,
+      reasoningTokens: 0,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 50,
     });
 
     await store.updateMetrics("session-metrics-overwrite", {
@@ -504,6 +578,11 @@ describe("D1 SessionIndexStore", () => {
       activeDurationMs: 180000,
       messageCount: 8,
       prCount: 2,
+      inputTokens: 300,
+      outputTokens: 60,
+      reasoningTokens: 10,
+      cacheReadTokens: 900,
+      cacheWriteTokens: 75,
     });
 
     const session = await store.get("session-metrics-overwrite");
@@ -511,6 +590,13 @@ describe("D1 SessionIndexStore", () => {
     expect(session!.activeDurationMs).toBe(180000);
     expect(session!.messageCount).toBe(8);
     expect(session!.prCount).toBe(2);
+    expect(session).toMatchObject({
+      inputTokens: 300,
+      outputTokens: 60,
+      reasoningTokens: 10,
+      cacheReadTokens: 900,
+      cacheWriteTokens: 75,
+    });
   });
 
   it("updateMetrics returns false for non-existent session", async () => {
@@ -520,6 +606,11 @@ describe("D1 SessionIndexStore", () => {
       activeDurationMs: 1000,
       messageCount: 1,
       prCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
     });
     expect(result).toBe(false);
   });
@@ -530,6 +621,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "session-to-delete",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: "acme",
       repoName: "web-app",
@@ -553,6 +646,8 @@ describe("D1 SessionIndexStore", () => {
 
     await store.create({
       id: "status-ordering-1",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: "Ordering",
       repoOwner: "acme",
       repoName: "worker",
@@ -589,6 +684,8 @@ describe("D1 SessionIndexStore", () => {
       // Seed parent
       await store.create({
         id: parentId,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: "Parent",
         repoOwner: "owner",
         repoName: "repo",
@@ -606,6 +703,8 @@ describe("D1 SessionIndexStore", () => {
       // Seed child 1 (active)
       await store.create({
         id: childId1,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: "Child 1",
         repoOwner: "owner",
         repoName: "repo",
@@ -623,6 +722,8 @@ describe("D1 SessionIndexStore", () => {
       // Seed child 2 (completed)
       await store.create({
         id: childId2,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: "Child 2",
         repoOwner: "owner",
         repoName: "repo",
@@ -685,9 +786,72 @@ describe("D1 SessionIndexStore", () => {
       expect(children).toEqual([]);
     });
 
+    it("listActiveDescendantIds returns active descendants deepest-first through terminal ancestors", async () => {
+      const now = Date.now();
+      for (const [id, status, parentSessionId] of [
+        ["grandchild-active", "active", childId2],
+        ["grandchild-failed", "failed", childId1],
+      ] as const) {
+        await store.create({
+          id,
+          ownerTeamId: null,
+          visibility: "workspace",
+          title: null,
+          repoOwner: "owner",
+          repoName: "repo",
+          model: "anthropic/claude-sonnet-4-6",
+          reasoningEffort: null,
+          baseBranch: null,
+          status,
+          parentSessionId,
+          spawnSource: "agent",
+          spawnDepth: 2,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+
+      await expect(store.listActiveDescendantIds(parentId)).resolves.toEqual([
+        "grandchild-active",
+        childId1,
+      ]);
+      await expect(store.listActiveDescendantIds("nonexistent-parent")).resolves.toEqual([]);
+    });
+
+    it("listActiveDescendantIds stops walking a parent cycle at the depth limit", async () => {
+      // Child 1 becomes its own grandparent: parent -> child 1 -> cycle -> child 1.
+      const now = Date.now();
+      await store.create({
+        id: "cycle-child",
+        ownerTeamId: null,
+        visibility: "workspace",
+        title: null,
+        repoOwner: "owner",
+        repoName: "repo",
+        model: "anthropic/claude-sonnet-4-6",
+        reasoningEffort: null,
+        baseBranch: null,
+        status: "active",
+        parentSessionId: childId1,
+        spawnSource: "agent",
+        spawnDepth: 2,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await env.DB.prepare("UPDATE sessions SET parent_session_id = ? WHERE id = ?")
+        .bind("cycle-child", childId1)
+        .run();
+
+      const ids = await store.listActiveDescendantIds(childId1);
+
+      expect(ids).toHaveLength(10);
+      expect(new Set(ids)).toEqual(new Set([childId1, "cycle-child"]));
+    });
+
     it("countTotalChildren counts all children regardless of status", async () => {
       const count = await store.countTotalChildren(parentId);
       expect(count).toBe(2);
+      expect(await store.countTotalChildren("nonexistent-parent")).toBe(0);
     });
 
     it("isChildOf returns true for valid parent-child pair", async () => {
@@ -698,6 +862,7 @@ describe("D1 SessionIndexStore", () => {
     it("isChildOf returns false for unrelated sessions", async () => {
       const result = await store.isChildOf(childId1, "unrelated-session");
       expect(result).toBe(false);
+      expect(await store.isChildOf("nonexistent", parentId)).toBe(false);
     });
 
     it("isChildOf returns false for reversed parent-child", async () => {
@@ -736,6 +901,8 @@ describe("D1 SessionIndexStore", () => {
 
       await store.create({
         id: "session-with-user",
+        ownerTeamId: null,
+        visibility: "workspace",
         title: "User-linked session",
         repoOwner: "acme",
         repoName: "web-app",
@@ -759,6 +926,8 @@ describe("D1 SessionIndexStore", () => {
 
       await store.create({
         id: "session-no-user",
+        ownerTeamId: null,
+        visibility: "workspace",
         title: "No user",
         repoOwner: "acme",
         repoName: "web-app",
@@ -780,6 +949,8 @@ describe("D1 SessionIndexStore", () => {
     const store = new SessionIndexStore(env.DB);
     const now = Date.now();
     const baseSession = {
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       title: null,
       repoOwner: "acme",
       repoName: "web-app",
@@ -828,6 +999,8 @@ describe("D1 SessionIndexStore", () => {
     const store = new SessionIndexStore(env.DB);
     const now = Date.now();
     const baseSession = {
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       title: null,
       repoOwner: "acme",
       repoName: "web-app",
@@ -876,6 +1049,8 @@ describe("D1 SessionIndexStore", () => {
     ): Promise<void> {
       await store.create({
         id,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: id,
         repoOwner: "acme",
         repoName: "web-app",
@@ -946,12 +1121,14 @@ describe("D1 SessionIndexStore", () => {
     });
   });
 
-  describe("repairStatus", () => {
+  describe("revision-fenced status repair", () => {
     const HOUR_MS = 60 * 60 * 1000;
 
     async function seedDraft(store: SessionIndexStore, id: string, updatedAt: number) {
       await store.create({
         id,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: id,
         repoOwner: "acme",
         repoName: "web-app",
@@ -969,7 +1146,14 @@ describe("D1 SessionIndexStore", () => {
       const updatedAt = Date.now() - 48 * HOUR_MS;
       await seedDraft(store, "diverged", updatedAt);
 
-      expect(await store.repairStatus("diverged", "completed")).toBe(true);
+      expect(
+        await new SessionStatusProjectionStore(env.DB).project(
+          "diverged",
+          "completed",
+          1,
+          updatedAt
+        )
+      ).toBe(true);
 
       const session = await store.get("diverged");
       expect(session!.status).toBe("completed");
@@ -993,23 +1177,32 @@ describe("D1 SessionIndexStore", () => {
         false
       );
 
-      expect(await store.repairStatus("index-ahead", "completed")).toBe(true);
+      expect(
+        await new SessionStatusProjectionStore(env.DB).project(
+          "index-ahead",
+          "completed",
+          1,
+          durableObjectUpdatedAt
+        )
+      ).toBe(true);
       expect((await store.get("index-ahead"))!.status).toBe("completed");
     });
 
-    it("reports no change when the index already agrees", async () => {
+    it("idempotently confirms the revision when the index already agrees", async () => {
       const store = new SessionIndexStore(env.DB);
       await seedDraft(store, "agreed", Date.now() - 48 * HOUR_MS);
 
-      expect(await store.repairStatus("agreed", "created")).toBe(false);
+      const projection = new SessionStatusProjectionStore(env.DB);
+      expect(await projection.project("agreed", "created", 1, 0)).toBe(true);
+      expect(await projection.project("agreed", "created", 1, 0)).toBe(true);
     });
 
     it("does not overwrite a newer non-draft projection", async () => {
       const store = new SessionIndexStore(env.DB);
       await seedDraft(store, "advanced", Date.now() - 48 * HOUR_MS);
-      expect(await store.updateStatus("advanced", "active", Date.now())).toBe(true);
-
-      expect(await store.repairStatus("advanced", "completed")).toBe(false);
+      const projection = new SessionStatusProjectionStore(env.DB);
+      expect(await projection.project("advanced", "active", 2, Date.now())).toBe(true);
+      expect(await projection.project("advanced", "completed", 1, Date.now())).toBe(false);
       expect((await store.get("advanced"))!.status).toBe("active");
     });
   });

@@ -1,6 +1,7 @@
 """Tests for bounded session attachment processing."""
 
 import asyncio
+import base64
 from typing import Any
 
 import pytest
@@ -86,7 +87,7 @@ def test_pdf_attachment_builds_data_url_file_part() -> None:
         log=TestLogger(),
         warn_user=_noop_warn,
     )
-    parts = processor.build_file_parts(
+    parts = processor.build_opencode_parts(
         [{"name": "doc.pdf", "mimeType": "application/pdf", "content": "QUJD"}]
     )
     assert parts == [
@@ -95,6 +96,27 @@ def test_pdf_attachment_builds_data_url_file_part() -> None:
             "mime": "application/pdf",
             "filename": "doc.pdf",
             "url": "data:application/pdf;base64,QUJD",
+        }
+    ]
+
+
+def test_markdown_attachment_builds_text_part() -> None:
+    """Providers reject text/markdown file parts, so Markdown goes inline as text."""
+    processor = AttachmentProcessor(
+        control_plane_url="https://control.example",
+        session_id="session-1",
+        auth_token="token",
+        log=TestLogger(),
+        warn_user=_noop_warn,
+    )
+    content = base64.b64encode("# Plan\n\nShip it — æøå".encode()).decode("ascii")
+    parts = processor.build_opencode_parts(
+        [{"name": 'my "notes".md', "mimeType": "text/markdown", "content": content}]
+    )
+    assert parts == [
+        {
+            "type": "text",
+            "text": '<attachment name="my &quot;notes&quot;.md">\n# Plan\n\nShip it — æøå\n</attachment>',
         }
     ]
 

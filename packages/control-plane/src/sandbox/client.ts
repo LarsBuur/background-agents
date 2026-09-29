@@ -5,6 +5,7 @@
  * All requests are authenticated using HMAC-signed tokens.
  */
 
+import type { HarnessId } from "@open-inspect/shared/harnesses";
 import { generateInternalToken } from "@open-inspect/shared/auth";
 import type { ImageBuildScopeKind } from "@open-inspect/shared/types/image-builds";
 import type { McpServerConfig, SandboxSettings } from "@open-inspect/shared/types/integrations";
@@ -13,7 +14,10 @@ import { createLogger } from "../logger";
 import type { CorrelationContext } from "../logger";
 import { buildSessionConfig, toRepositoryConfigPayload } from "./sandbox-env";
 import type { SessionRepositoryInfo } from "./provider";
+import { parsePendingVmReference } from "./providers/pending-vm-reference";
 import { withRequestDeadline } from "./request-deadline";
+
+export type ModalBackend = "modal" | "modal-vm";
 
 const log = createLogger("modal-client");
 
@@ -28,83 +32,70 @@ export const MODAL_SANDBOX_START_REQUEST_DEADLINE_MS = 60_000;
 export const MODAL_SNAPSHOT_REQUEST_DEADLINE_MS = 310_000;
 export const MODAL_CLEANUP_REQUEST_DEADLINE_MS = 60_000;
 
-const modalErrorResponseSchema = z.object({
-  success: z.literal(false),
-  error: z.string().optional(),
-});
-
 const modalTunnelUrlsSchema = z.record(z.string(), z.string());
 
-const createSandboxModalResponseSchema = z.discriminatedUnion("success", [
-  z.object({
-    success: z.literal(true),
-    data: z.object({
-      sandbox_id: z.string(),
-      modal_object_id: z.string().nullable().optional(),
-      created_at: z.number(),
-      code_server_url: z.string().nullable().optional(),
-      code_server_password: z.string().nullable().optional(),
-      vnc_url: z.string().nullable().optional(),
-      vnc_password: z.string().nullable().optional(),
-      ttyd_url: z.string().nullable().optional(),
-      tunnel_urls: modalTunnelUrlsSchema.nullable().optional(),
-    }),
+const createSandboxModalResponseSchema = z.object({
+  success: z.literal(true),
+  data: z.object({
+    sandbox_id: z.string(),
+    modal_object_id: z.string().nullable().optional(),
+    sandbox_backend: z.unknown().optional(),
+    created_at: z.number(),
+    code_server_url: z.string().nullable().optional(),
+    code_server_password: z.string().nullable().optional(),
+    vnc_url: z.string().nullable().optional(),
+    vnc_password: z.string().nullable().optional(),
+    ttyd_url: z.string().nullable().optional(),
+    tunnel_urls: modalTunnelUrlsSchema.nullable().optional(),
   }),
-  modalErrorResponseSchema,
-]);
+});
 
-const restoreSandboxModalResponseSchema = z.discriminatedUnion("success", [
-  z.object({
-    success: z.literal(true),
-    data: z
-      .object({
-        sandbox_id: z.string().optional(),
-        modal_object_id: z.string().nullable().optional(),
-        code_server_url: z.string().nullable().optional(),
-        code_server_password: z.string().nullable().optional(),
-        vnc_url: z.string().nullable().optional(),
-        vnc_password: z.string().nullable().optional(),
-        ttyd_url: z.string().nullable().optional(),
-        tunnel_urls: modalTunnelUrlsSchema.nullable().optional(),
-      })
-      .optional(),
+const restoreSandboxModalResponseSchema = z.object({
+  success: z.literal(true),
+  data: z.object({
+    sandbox_id: z.string().min(1),
+    modal_object_id: z.string().nullable().optional(),
+    sandbox_backend: z.unknown().optional(),
+    code_server_url: z.string().nullable().optional(),
+    code_server_password: z.string().nullable().optional(),
+    vnc_url: z.string().nullable().optional(),
+    vnc_password: z.string().nullable().optional(),
+    ttyd_url: z.string().nullable().optional(),
+    tunnel_urls: modalTunnelUrlsSchema.nullable().optional(),
   }),
-  modalErrorResponseSchema,
-]);
+});
 
-const snapshotSandboxModalResponseSchema = z.discriminatedUnion("success", [
-  z.object({
-    success: z.literal(true),
-    data: z
-      .object({
-        image_id: z.string(),
-      })
-      .optional(),
+const resolveVmSandboxModalResponseSchema = restoreSandboxModalResponseSchema.extend({
+  data: restoreSandboxModalResponseSchema.shape.data.extend({
+    modal_object_id: z.string().min(1),
   }),
-  modalErrorResponseSchema,
-]);
+});
 
-const createImageBuildSandboxModalResponseSchema = z.discriminatedUnion("success", [
-  z.object({
-    success: z.literal(true),
-    data: z.object({
-      // Non-empty: the previous hand-rolled check rejected a blank id.
-      provider_session_id: z.string().min(1),
-    }),
+const snapshotSandboxModalResponseSchema = z.object({
+  success: z.literal(true),
+  data: z.object({
+    image_id: z.string().min(1),
+    source_stopped: z.boolean().optional(),
+    source_id: z.string().min(1).optional(),
   }),
-  modalErrorResponseSchema,
-]);
+});
+
+const createImageBuildSandboxModalResponseSchema = z.object({
+  success: z.literal(true),
+  data: z.object({
+    // Non-empty: the previous hand-rolled check rejected a blank id.
+    provider_session_id: z.string().min(1),
+    sandbox_backend: z.unknown().optional(),
+  }),
+});
 
 /**
- * Image-build operations (start/terminate) only signal success or failure; their
+ * Image-build operation 2xx responses only expose a success marker here. Their
  * `data` payload is never read, so it is deliberately left unvalidated.
  */
-const imageBuildOperationModalResponseSchema = z.discriminatedUnion("success", [
-  z.object({
-    success: z.literal(true),
-  }),
-  modalErrorResponseSchema,
-]);
+const imageBuildOperationModalResponseSchema = z.object({
+  success: z.literal(true),
+});
 
 function parseModalApiResponse<T>(schema: z.ZodType<T>, body: unknown): T {
   const result = schema.safeParse(body);
@@ -156,7 +147,12 @@ export function buildModalSandboxDashboardUrl(params: {
   modalEnvironment?: string | undefined;
   providerObjectId: string | null | undefined;
 }): string | null {
-  if (!params.workspace || !params.providerObjectId) return null;
+  if (
+    !params.workspace ||
+    !params.providerObjectId ||
+    parsePendingVmReference(params.providerObjectId) !== null
+  )
+    return null;
   const workspace = encodeURIComponent(params.workspace);
   const modalEnvironment = encodeURIComponent(params.modalEnvironment || DEFAULT_MODAL_ENVIRONMENT);
   const providerObjectId = encodeURIComponent(params.providerObjectId);
@@ -164,13 +160,17 @@ export function buildModalSandboxDashboardUrl(params: {
 }
 
 export interface CreateSandboxRequest {
+  sandboxBackend?: ModalBackend;
+  retireSandboxId?: string | null;
+  launchDeadlineAtMs?: number;
   sessionId: string;
   sandboxId?: string; // Expected sandbox ID (generated by control plane)
   repoOwner: string | null;
   repoName: string | null;
   controlPlaneUrl: string;
   sandboxAuthToken: string;
-  opencodeSessionId?: string;
+  agentSessionId?: string;
+  harness: HarnessId;
   provider?: string;
   model?: string;
   userEnvVars?: Record<string, string>;
@@ -188,6 +188,8 @@ export interface CreateSandboxRequest {
 }
 
 export interface CreateSandboxResponse {
+  /** Validated by the provider after retaining the allocation handle. */
+  sandboxBackend?: unknown;
   sandboxId: string;
   modalObjectId?: string; // Modal's internal object ID for snapshot API
   createdAt: number;
@@ -200,6 +202,9 @@ export interface CreateSandboxResponse {
 }
 
 export interface RestoreSandboxRequest {
+  sandboxBackend?: ModalBackend;
+  retireSandboxId?: string | null;
+  launchDeadlineAtMs?: number;
   snapshotImageId: string;
   sessionId: string;
   sandboxId: string;
@@ -207,6 +212,7 @@ export interface RestoreSandboxRequest {
   controlPlaneUrl: string;
   repoOwner: string | null;
   repoName: string | null;
+  harness: HarnessId;
   provider: string;
   model: string;
   userEnvVars?: Record<string, string>;
@@ -222,10 +228,10 @@ export interface RestoreSandboxRequest {
 }
 
 export interface RestoreSandboxResponse {
-  success: boolean;
-  sandboxId?: string;
+  /** Validated by the provider after retaining the allocation handle. */
+  sandboxBackend?: unknown;
+  sandboxId: string;
   modalObjectId?: string;
-  error?: string;
   codeServerUrl?: string;
   codeServerPassword?: string;
   vncUrl?: string;
@@ -234,16 +240,31 @@ export interface RestoreSandboxResponse {
   tunnelUrls?: Record<string, string>;
 }
 
+export interface ResolveVmSandboxRequest {
+  sessionId: string;
+  sandboxId: string;
+}
+
+export type ResolveVmSandboxResponse = RestoreSandboxResponse & { modalObjectId: string };
+
 export interface SnapshotSandboxRequest {
+  providerObjectId: string;
+  sessionId: string;
+  sandboxBackend?: ModalBackend;
+  signal?: AbortSignal;
+  deadlineAtMs?: number;
+}
+
+export interface StopSandboxRequest {
   providerObjectId: string;
   sessionId: string;
   signal?: AbortSignal;
 }
 
 export interface SnapshotSandboxResponse {
-  success: boolean;
-  imageId?: string;
-  error?: string;
+  sourceStopped?: boolean;
+  sourceObjectId?: string;
+  imageId: string;
 }
 
 export interface SnapshotBuildSandboxRequest {
@@ -253,6 +274,8 @@ export interface SnapshotBuildSandboxRequest {
 }
 
 export interface CreateImageBuildSandboxRequest {
+  resources?: Pick<SandboxSettings, "cpuCores" | "memoryMib">;
+  sandboxBackend?: ModalBackend;
   /** Scope kind ("repo" | "environment") — accepted by Modal for logging only. */
   scopeKind: ImageBuildScopeKind;
   /** Scope id (lowercase owner/name or environment id) — logging only. */
@@ -273,6 +296,8 @@ export interface CreateImageBuildSandboxRequest {
 }
 
 export interface CreateImageBuildSandboxResponse {
+  /** Validated by the provider after retaining the allocation handle. */
+  sandboxBackend?: unknown;
   providerSessionId: string;
 }
 
@@ -297,10 +322,28 @@ export interface TerminateImageBuildSandboxRequest {
 export class ModalApiError extends Error {
   constructor(
     message: string,
-    public readonly status: number
+    public readonly status: number,
+    public readonly detail?: string
   ) {
     super(message);
     this.name = "ModalApiError";
+  }
+}
+
+export type ModalVmStartupOutcome =
+  | "unknown"
+  | "not_visible"
+  | "other_generation"
+  | "window_closed"
+  | "race_pending";
+
+export class ModalVmStartupError extends Error {
+  constructor(
+    public readonly outcome: ModalVmStartupOutcome,
+    public readonly cause: Error
+  ) {
+    super(cause.message);
+    this.name = "ModalVmStartupError";
   }
 }
 
@@ -312,8 +355,11 @@ export class ModalApiError extends Error {
 export class ModalClient {
   private createSandboxUrl: string;
   private snapshotSandboxUrl: string;
+  private snapshotVmSandboxUrl: string;
   private snapshotBuildSandboxUrl: string;
   private restoreSandboxUrl: string;
+  private resolveVmSandboxUrl: string;
+  private stopSandboxUrl: string;
   private createImageBuildSandboxUrl: string;
   private startImageBuildSandboxUrl: string;
   private terminateImageBuildSandboxUrl: string;
@@ -327,23 +373,67 @@ export class ModalClient {
     schema: z.ZodType<T>,
     correlation: CorrelationContext | undefined,
     callerSignal: AbortSignal | undefined,
-    onResponse: (status: number) => void
+    onResponse: (status: number) => void,
+    vmStartup = false
   ): Promise<T> {
     const headers = await this.getPostHeaders(correlation);
-    return withRequestDeadline("Modal", endpoint, deadlineMs, callerSignal, async (signal) => {
-      const response = await fetch(url, {
-        method: "POST",
-        headers,
-        signal,
-        body: JSON.stringify(body),
-      });
-      onResponse(response.status);
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
+    const payload = JSON.stringify(body);
+    try {
+      return await withRequestDeadline(
+        "Modal",
+        endpoint,
+        deadlineMs,
+        callerSignal,
+        async (signal) => {
+          const response = await fetch(url, {
+            method: "POST",
+            headers,
+            signal,
+            body: payload,
+          });
+          onResponse(response.status);
+          if (!response.ok) {
+            const text = await response.text();
+            let body: unknown;
+            try {
+              body = JSON.parse(text);
+            } catch {
+              // Non-JSON provider responses still retain their status and raw text.
+            }
+            const detail =
+              body !== null &&
+              typeof body === "object" &&
+              "detail" in body &&
+              typeof body.detail === "string"
+                ? body.detail
+                : undefined;
+            throw new ModalApiError(
+              `Modal API error: ${response.status} ${text}`,
+              response.status,
+              detail
+            );
+          }
+          return parseModalApiResponse(schema, await response.json());
+        }
+      );
+    } catch (error) {
+      if (!vmStartup) throw error;
+      if (error instanceof ModalApiError) {
+        const detail = error.detail;
+        if (
+          detail === "not_visible" ||
+          detail === "other_generation" ||
+          detail === "window_closed" ||
+          detail === "race_pending"
+        )
+          throw new ModalVmStartupError(detail, error);
+        if (error.status < 500) throw error;
       }
-      return parseModalApiResponse(schema, await response.json());
-    });
+      throw new ModalVmStartupError(
+        "unknown",
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
   }
 
   constructor(secret: string, workspace: string, environmentWebSuffix?: string, apiUrl?: string) {
@@ -358,8 +448,11 @@ export class ModalClient {
       modalEndpointUrl(functionName, workspace, environmentWebSuffix, apiUrl);
     this.createSandboxUrl = url("api-create-sandbox");
     this.snapshotSandboxUrl = url("api-snapshot-sandbox");
+    this.snapshotVmSandboxUrl = url("api-snapshot-vm-sandbox");
     this.snapshotBuildSandboxUrl = url("api-snapshot-build-sandbox");
     this.restoreSandboxUrl = url("api-restore-sandbox");
+    this.resolveVmSandboxUrl = url("api-resolve-vm-sandbox");
+    this.stopSandboxUrl = url("api-stop-sandbox");
     this.createImageBuildSandboxUrl = url("api-create-build-sandbox");
     this.startImageBuildSandboxUrl = url("api-start-build-sandbox");
     this.terminateImageBuildSandboxUrl = url("api-terminate-build-sandbox");
@@ -405,7 +498,8 @@ export class ModalClient {
           repo_name: request.repoName,
           control_plane_url: request.controlPlaneUrl,
           sandbox_auth_token: request.sandboxAuthToken,
-          opencode_session_id: request.opencodeSessionId || null,
+          agent_session_id: request.agentSessionId || null,
+          harness: request.harness,
           provider: request.provider || "anthropic",
           model: request.model || "claude-sonnet-4-6",
           user_env_vars: request.userEnvVars || null,
@@ -418,27 +512,29 @@ export class ModalClient {
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
           mcp_servers: request.mcpServers || null,
           sandbox_settings: request.sandboxSettings ?? null,
+          sandbox_backend: request.sandboxBackend,
+          retire_sandbox_id: request.retireSandboxId,
+          launch_deadline_at_ms: request.launchDeadlineAtMs ?? null,
           // Flat keys matching SessionConfig field names — Modal's create
           // handler builds its SessionConfig from the request by field name
           // (unlike restore, which carries a nested session_config).
           repositories: request.repositories?.length
             ? request.repositories.map(toRepositoryConfigPayload)
             : null,
+          bridge_early_connect: true,
         },
         createSandboxModalResponseSchema,
         correlation,
         request.signal,
-        (status) => (httpStatus = status)
+        (status) => (httpStatus = status),
+        request.sandboxBackend === "modal-vm"
       );
-
-      if (!result.success) {
-        throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
-      }
 
       outcome = "success";
       return {
         sandboxId: result.data.sandbox_id,
         modalObjectId: result.data.modal_object_id ?? undefined,
+        sandboxBackend: result.data.sandbox_backend,
         createdAt: result.data.created_at,
         codeServerUrl: result.data.code_server_url ?? undefined,
         codeServerPassword: result.data.code_server_password ?? undefined,
@@ -491,28 +587,28 @@ export class ModalClient {
           vnc_enabled: request.vncEnabled ?? false,
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
           sandbox_settings: request.sandboxSettings ?? null,
+          sandbox_backend: request.sandboxBackend,
+          retire_sandbox_id: request.retireSandboxId,
+          launch_deadline_at_ms: request.launchDeadlineAtMs ?? null,
         },
         restoreSandboxModalResponseSchema,
         correlation,
         request.signal,
-        (status) => (httpStatus = status)
+        (status) => (httpStatus = status),
+        request.sandboxBackend === "modal-vm"
       );
-
-      if (!result.success) {
-        return { success: false, error: result.error || "Unknown restore error" };
-      }
 
       outcome = "success";
       return {
-        success: true,
-        sandboxId: result.data?.sandbox_id,
-        modalObjectId: result.data?.modal_object_id ?? undefined,
-        codeServerUrl: result.data?.code_server_url ?? undefined,
-        codeServerPassword: result.data?.code_server_password ?? undefined,
-        vncUrl: result.data?.vnc_url ?? undefined,
-        vncPassword: result.data?.vnc_password ?? undefined,
-        ttydUrl: result.data?.ttyd_url ?? undefined,
-        tunnelUrls: result.data?.tunnel_urls ?? undefined,
+        sandboxId: result.data.sandbox_id,
+        modalObjectId: result.data.modal_object_id ?? undefined,
+        sandboxBackend: result.data.sandbox_backend,
+        codeServerUrl: result.data.code_server_url ?? undefined,
+        codeServerPassword: result.data.code_server_password ?? undefined,
+        vncUrl: result.data.vnc_url ?? undefined,
+        vncPassword: result.data.vnc_password ?? undefined,
+        ttydUrl: result.data.ttyd_url ?? undefined,
+        tunnelUrls: result.data.tunnel_urls ?? undefined,
       };
     } finally {
       log.info("modal.request", {
@@ -529,9 +625,35 @@ export class ModalClient {
     }
   }
 
-  /**
-   * Trigger a filesystem snapshot for a sandbox object.
-   */
+  /** Lookup-only recovery of a generation's named Modal VM allocation. */
+  async resolveVmSandbox(
+    request: ResolveVmSandboxRequest,
+    correlation?: CorrelationContext
+  ): Promise<ResolveVmSandboxResponse> {
+    const result = await this.postJson(
+      this.resolveVmSandboxUrl,
+      "resolveVmSandbox",
+      MODAL_SANDBOX_START_REQUEST_DEADLINE_MS,
+      { session_id: request.sessionId, sandbox_id: request.sandboxId },
+      resolveVmSandboxModalResponseSchema,
+      correlation,
+      undefined,
+      () => {}
+    );
+    return {
+      sandboxId: result.data.sandbox_id,
+      modalObjectId: result.data.modal_object_id,
+      sandboxBackend: result.data.sandbox_backend,
+      codeServerUrl: result.data.code_server_url ?? undefined,
+      codeServerPassword: result.data.code_server_password ?? undefined,
+      vncUrl: result.data.vnc_url ?? undefined,
+      vncPassword: result.data.vnc_password ?? undefined,
+      ttydUrl: result.data.ttyd_url ?? undefined,
+      tunnelUrls: result.data.tunnel_urls ?? undefined,
+    };
+  }
+
+  /** Trigger a filesystem snapshot for a sandbox object. */
   async snapshotSandbox(
     request: SnapshotSandboxRequest,
     correlation?: CorrelationContext
@@ -543,27 +665,30 @@ export class ModalClient {
 
     try {
       const result = await this.postJson(
-        this.snapshotSandboxUrl,
+        request.sandboxBackend === "modal-vm" ? this.snapshotVmSandboxUrl : this.snapshotSandboxUrl,
         endpoint,
-        MODAL_SNAPSHOT_REQUEST_DEADLINE_MS,
+        request.deadlineAtMs === undefined
+          ? MODAL_SNAPSHOT_REQUEST_DEADLINE_MS
+          : Math.max(
+              1,
+              Math.min(MODAL_SNAPSHOT_REQUEST_DEADLINE_MS, request.deadlineAtMs - Date.now())
+            ),
         {
           sandbox_id: request.providerObjectId,
+          deadline_at_ms: request.deadlineAtMs ?? null,
+          ...(request.sandboxBackend ? { sandbox_backend: request.sandboxBackend } : {}),
         },
         snapshotSandboxModalResponseSchema,
         correlation,
         request.signal,
         (status) => (httpStatus = status)
       );
-      if (!result.success) {
-        return { success: false, error: result.error || "Unknown snapshot error" };
-      }
-
-      if (!result.data?.image_id) {
-        return { success: false, error: "Snapshot response missing image_id" };
-      }
-
       outcome = "success";
-      return { success: true, imageId: result.data.image_id };
+      return {
+        imageId: result.data.image_id,
+        sourceStopped: result.data.source_stopped,
+        sourceObjectId: result.data.source_id,
+      };
     } finally {
       log.info("modal.request", {
         event: "modal.request",
@@ -577,6 +702,19 @@ export class ModalClient {
         outcome,
       });
     }
+  }
+
+  async stopSandbox(request: StopSandboxRequest, correlation?: CorrelationContext): Promise<void> {
+    await this.postJson(
+      this.stopSandboxUrl,
+      "stopSandbox",
+      MODAL_CLEANUP_REQUEST_DEADLINE_MS,
+      { sandbox_id: request.providerObjectId },
+      imageBuildOperationModalResponseSchema,
+      correlation,
+      request.signal,
+      () => {}
+    );
   }
 
   /**
@@ -605,15 +743,8 @@ export class ModalClient {
         request.signal,
         (status) => (httpStatus = status)
       );
-      if (!result.success) {
-        return { success: false, error: result.error || "Unknown snapshot error" };
-      }
-      if (!result.data?.image_id) {
-        return { success: false, error: "Snapshot response missing image_id" };
-      }
-
       outcome = "success";
-      return { success: true, imageId: result.data.image_id };
+      return { imageId: result.data.image_id, sourceStopped: result.data.source_stopped };
     } finally {
       log.info("modal.request", {
         event: "modal.request",
@@ -644,6 +775,8 @@ export class ModalClient {
         endpoint,
         MODAL_SANDBOX_START_REQUEST_DEADLINE_MS,
         {
+          sandbox_backend: request.sandboxBackend,
+          sandbox_settings: request.resources,
           scope_kind: request.scopeKind,
           scope_id: request.scopeId,
           build_id: request.buildId,
@@ -663,13 +796,10 @@ export class ModalClient {
         (status) => (httpStatus = status)
       );
 
-      if (result.success === false) {
-        throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
-      }
-
       outcome = "success";
       return {
         providerSessionId: result.data.provider_session_id,
+        sandboxBackend: result.data.sandbox_backend,
       };
     } finally {
       log.info("modal.request", {
@@ -735,7 +865,7 @@ export class ModalClient {
     let httpStatus: number | undefined;
     let outcome: "success" | "error" = "error";
     try {
-      const result = await this.postJson(
+      await this.postJson(
         url,
         endpoint,
         deadlineMs,
@@ -745,9 +875,6 @@ export class ModalClient {
         request.signal,
         (status) => (httpStatus = status)
       );
-      if (result.success === false) {
-        throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
-      }
       outcome = "success";
     } finally {
       log.info("modal.request", {

@@ -3,9 +3,15 @@
 Uses real OpenCode 1.18.29, an isolated catalog/config, and fake localhost providers.
 Only reasoning settings are retained from requests; no real provider keys are used.
 
-Fixture: public subset of https://models.opencode.ai/api.json, retrieved 2026-09-04.
-Source SHA-256: ef112420273b7e572ef9c87db13a2f30fe1a562c29ea30d365b911889f9ff46c
-Subset SHA-256: 18e7e0ca29f785f273d50776d9d96f6dd2be6e754d62d14d73b23325d7eac6da
+Fixture: public subset of https://models.opencode.ai/api.json, retrieved 2026-09-09.
+Source SHA-256: a55f5a544d356a15a6491bc3293f2dabb692a381e65cce69fee4741de9636733
+GPT-6 Sol and Luna added from the 2026-09-22 retrieval.
+Source SHA-256: c9d3dc07540cf91a7b7362a3b42943132965f4ee6e8374113ee4f0f7b56b3d90
+Claude Opus 5.5 added from the 2026-09-23 retrieval.
+Source SHA-256: e20acec396a73dc3db45d0eca7f0ede5bff28f09f002ba96ce7b1b566de7b6d0
+Claude Sonnet 5.5 added from the 2026-09-28 retrieval.
+Source SHA-256: 06e0071dd4ae9c9da2db1fabf28eb4994914fefdc5dd10270a5b340c88a49aec
+Subset SHA-256: e9c9cc6f90fa9afbc75a2f18bf564398594d3f51693667cf1efd229617aaab0b
 Reconcile this frozen fixture with shared model/effort definitions when changing
 models or the binary. Mocks verify serialization, not live provider acceptance.
 """
@@ -164,19 +170,19 @@ async def wire_server(tmp_path, reasoning_config):
             stderr=subprocess.DEVNULL,
         )
 
-        def call(path, body=None):
+        def call(path, body=None, timeout_seconds=30):
             request = urllib.request.Request(
                 f"http://127.0.0.1:{port}" + path,
                 data=json.dumps(body).encode() if body is not None else None,
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 return json.load(response)
 
         deadline = time.monotonic() + 30
         while True:
             try:
-                call("/global/health")
+                call("/global/health", timeout_seconds=1)
                 break
             except OSError:
                 if process.poll() is not None or time.monotonic() >= deadline:
@@ -200,7 +206,7 @@ def submit(call, captured, model, effort, session=None):
     if session is None:
         session = call("/session", {"title": "Reasoning contract"})["id"]
     stream = make_stream()
-    stream._attachment_processor.build_file_parts.return_value = []
+    stream._attachment_processor.build_opencode_parts.return_value = []
     body = stream._build_prompt_request_body(
         "Reply only OK. Do not use tools.", model, reasoning_effort=effort
     )

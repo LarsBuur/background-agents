@@ -14,6 +14,12 @@ locals {
     "docker-compose.aws.yml"                       = "${local.repository_root}/docker-compose.aws.yml"
     "packages/control-plane/docker/Caddyfile"      = "${local.repository_root}/packages/control-plane/docker/Caddyfile"
     "packages/control-plane/docker/litestream.yml" = "${local.repository_root}/packages/control-plane/docker/litestream.yml"
+
+    # Not part of the compose stack: the activation sequence itself. It ships
+    # here rather than in user data because `aws_instance.this` ignores
+    # `user_data_base64` -- cloud-init's copy of anything is frozen at the
+    # instance's first boot, while this arrives on every fetch.
+    "deploy.sh" = "${path.module}/files/deploy.sh"
   }
 
   # Everything the infrastructure itself decides. An entry in var.config wins,
@@ -21,9 +27,10 @@ locals {
   #
   # The variables this deliberately leaves out are as load-bearing as the ones
   # it sets. OBJECT_STORE_ENDPOINT and LITESTREAM_ENDPOINT unset mean AWS S3
-  # rather than MinIO; the four credential variables unset mean the SDK finds
-  # the instance role. An SSM parameter cannot hold an empty string, so "unset"
-  # here is "no parameter", which is exactly how the host reads it.
+  # rather than the compose stack's object store; the four credential
+  # variables unset mean the SDK finds the instance role. An SSM parameter
+  # cannot hold an empty string, so "unset" here is "no parameter", which is
+  # exactly how the host reads it.
   derived_config = {
     DEPLOYMENT_NAME = var.name
 
@@ -42,16 +49,10 @@ locals {
     DATA_DIR            = "/data"
     APP_BIND_ADDRESS    = "127.0.0.1"
 
-    # Read by docker-compose.aws.yml, and the reason a tag change takes effect
-    # at all: user data is ignored after first boot, so an image reference
-    # written only there would leave `terraform apply` with nothing to do while
-    # the instance went on pulling its old one.
-    CONTROL_PLANE_IMAGE = local.image
-
     # docker-compose.yml refuses to start without this one, and Compose
-    # interpolates the base file whether or not MinIO is among the services the
-    # AWS overlay leaves running. Nothing reads it here.
-    MINIO_ROOT_PASSWORD = "unused-on-aws"
+    # interpolates the base file whether or not the local object store is among
+    # the services the AWS overlay leaves running. Nothing reads it here.
+    OBJECT_STORE_ROOT_PASSWORD = "unused-on-aws"
   }
 
   # `for_each` needs its keys known at plan time, and filtering on a value makes
@@ -61,15 +62,23 @@ locals {
   # operator therefore cannot blank a derived value by setting it to "".
   #
   # MIGRATIONS_DIR is absent on purpose (the image sets its own), as are the
-  # endpoint and credential variables, per the comment above.
+  # endpoint and credential variables, per the comment above. CONTROL_PLANE_IMAGE
+  # is absent because it is its own resource below, owned differently.
   env_config = merge(
     local.derived_config,
     { for key, value in var.config : key => value if value != "" },
   )
 }
 
+# The instance reads these files and the parameters below together, at every
+# start. Uploading after the parameters are written keeps an apply that stops
+# partway from leaving a compose file that names a variable no parameter holds
+# yet; a parameter this apply drops is deleted only after the upload, so the
+# old file keeps its variables until then.
 resource "aws_s3_object" "stack" {
   for_each = local.stack_files
+
+  depends_on = [aws_ssm_parameter.config]
 
   bucket = aws_s3_bucket.backups.id
   key    = "stack/${each.key}"
@@ -111,4 +120,38 @@ resource "aws_ssm_parameter" "secret" {
   value_wo_version = 1
 
   tags = local.tags
+}
+
+# The deployed version, and the one parameter here whose value Terraform sets
+# once and then stops owning.
+#
+# It is an ordinary `.env` entry -- docker-compose.aws.yml reads it, and
+# `open-inspect-fetch-config` materializes it from SSM on every start -- which
+# is what makes a deploy a parameter write plus a restart rather than a new
+# instance. But a deploy has to be able to move it, and roll it back, without a
+# `terraform apply`: CI knows the digest it just pushed and Terraform does not.
+# So the module creates it at `control_plane_image_tag` for the first boot and
+# `ignore_changes` leaves every later value alone. Same boundary as the secrets
+# above, for the same reason.
+#
+# The consequence worth knowing: after the first deploy, `control_plane_image`
+# and `control_plane_image_tag` no longer describe what is running.
+# `terraform output deployed_image_parameter` names where that lives.
+# Before CI owned it, this same SSM name was one entry in the map above. Without
+# this, an upgrade plans a destroy and a create against one name, and whichever
+# order it picks either fails or resets the value CI last deployed.
+moved {
+  from = aws_ssm_parameter.config["CONTROL_PLANE_IMAGE"]
+  to   = aws_ssm_parameter.deployed_image
+}
+
+resource "aws_ssm_parameter" "deployed_image" {
+  name  = "${local.ssm_env_prefix}/CONTROL_PLANE_IMAGE"
+  type  = "String"
+  value = local.image
+  tags  = local.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 }

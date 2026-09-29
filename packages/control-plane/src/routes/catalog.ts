@@ -22,6 +22,7 @@ import { keyboardShortcutRoutes } from "./keyboard-shortcuts";
 import { mcpServerRoutes } from "./mcp-servers";
 import { modelPreferencesRoutes } from "./model-preferences";
 import { modelProviderAccountRoutes } from "./model-provider-accounts";
+import { providerRuntimeCredentialRoutes } from "./provider-runtime-credentials";
 import { rbacRoutes } from "./rbac";
 import { reposRoutes } from "./repos";
 import { scmSettingsRoutes } from "./scm-settings";
@@ -30,6 +31,7 @@ import { sessionRoutes } from "./sessions";
 import { slackNotifyRoutes } from "./slack-notify";
 import { signInProviderRoutes } from "./sign-in-providers";
 import { skillRoutes } from "./skills";
+import { teamRoutes } from "./teams";
 
 /** Registration order is the precedence order: each module is mounted where it appears. */
 export const catalog: readonly RouteModule[] = [
@@ -37,6 +39,8 @@ export const catalog: readonly RouteModule[] = [
 
   browserAuthRoutes,
   signInProviderRoutes,
+
+  teamRoutes,
 
   // Session management, then the agent-initiated Slack notification
   sessionRoutes,
@@ -60,6 +64,8 @@ export const catalog: readonly RouteModule[] = [
 
   // Subscription provider account management and sandbox access broker
   modelProviderAccountRoutes,
+  // Delivery of stored provider secrets to sandboxes (Anthropic)
+  providerRuntimeCredentialRoutes,
 
   // Integration settings
   integrationSettingsRoutes,

@@ -15,8 +15,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from sandbox_runtime.bridge import AgentBridge
+from sandbox_runtime.harness.opencode_stream import _PromptState
 from sandbox_runtime.opencode_identifier import OpenCodeIdentifier
-from sandbox_runtime.prompt_stream import _PromptState
 from tests.conftest import wire_opencode_transport
 
 
@@ -59,7 +59,7 @@ def bridge() -> AgentBridge:
         control_plane_url="http://localhost:8787",
         auth_token="test-token",
     )
-    bridge.opencode_session_id = "oc-session-123"
+    bridge.harness.session_id = "oc-session-123"
     wire_opencode_transport(bridge, MagicMock())
     return bridge
 
@@ -86,7 +86,7 @@ class TestToolCallEvent:
             input_data={"command": "ls -la"},
         )
 
-        event = bridge._ensure_prompt_stream()._tool_call_event(part, "cp-message-456")
+        event = bridge.harness.prompt_stream._tool_call_event(part, "cp-message-456")
 
         assert event is not None
         assert event["type"] == "tool_call"
@@ -102,7 +102,7 @@ class TestToolCallEvent:
             input_data={},
         )
 
-        event = bridge._ensure_prompt_stream()._tool_call_event(part, "cp-message-123")
+        event = bridge.harness.prompt_stream._tool_call_event(part, "cp-message-123")
 
         assert event is None
 
@@ -116,7 +116,7 @@ class TestToolCallEvent:
             output="file1.txt\nfile2.txt",
         )
 
-        event = bridge._ensure_prompt_stream()._tool_call_event(part, "cp-message-123")
+        event = bridge.harness.prompt_stream._tool_call_event(part, "cp-message-123")
 
         assert event is not None
         assert event["type"] == "tool_call"
@@ -128,20 +128,128 @@ class TestHandlePartTranslation:
     """Text and step parts are translated by _handle_part, the production
     path (with cumulative-text handling); tool parts are covered above."""
 
+    def test_step_ids_match_start_parts_across_steps_and_replay(self, bridge: AgentBridge):
+        stream = bridge.harness.prompt_stream
+        state = make_state("cp-message-123")
+        first_start = stream._handle_part(
+            state, {"type": "step-start", "id": "start-1", "messageID": "assistant-1"}, None
+        )[0]
+        first_finish = stream._handle_part(
+            state, {"type": "step-finish", "id": "finish-1", "messageID": "assistant-1"}, None
+        )[0]
+        second_start = stream._handle_part(
+            state, {"type": "step-start", "id": "start-2", "messageID": "assistant-1"}, None
+        )[0]
+        interleaved_replay = stream._handle_part(
+            state, {"type": "step-start", "id": "start-1", "messageID": "assistant-1"}, None
+        )[0]
+        corrected_finish = stream._handle_part(
+            state, {"type": "step-finish", "id": "finish-1", "messageID": "assistant-1"}, None
+        )[0]
+        second_finish = stream._handle_part(
+            state, {"type": "step-finish", "id": "finish-2", "messageID": "assistant-1"}, None
+        )[0]
+
+        assert first_start["stepId"] == first_finish["stepId"] == "start-1"
+        assert interleaved_replay["stepId"] == first_start["stepId"]
+        assert corrected_finish["stepId"] == first_start["stepId"]
+        assert second_start["stepId"] == second_finish["stepId"] == "start-2"
+        assert first_start["stepId"] != second_start["stepId"]
+        replayed_start = stream._handle_part(
+            state,
+            {"type": "step-start", "id": "start-1", "messageID": "assistant-1"},
+            None,
+        )[0]
+        assert replayed_start["stepId"] == first_finish["stepId"]
+        replayed_finish = stream._handle_part(
+            state, {"type": "step-finish", "id": "finish-1", "messageID": "assistant-1"}, None
+        )[0]
+        unmatched_finish = stream._handle_part(
+            state, {"type": "step-finish", "id": "finish-3", "messageID": "assistant-1"}, None
+        )[0]
+        assert replayed_finish["stepId"] == first_start["stepId"]
+        assert unmatched_finish["stepId"] == "finish-3"
+
+    def test_step_ids_are_separate_for_interleaved_messages(self, bridge: AgentBridge):
+        stream = bridge.harness.prompt_stream
+        state = make_state("cp-message-123")
+        parent_start = stream._handle_part(
+            state, {"type": "step-start", "id": "parent", "messageID": "parent-msg"}, None
+        )[0]
+        child_start = stream._handle_part(
+            state,
+            {"type": "step-start", "id": "child", "messageID": "child-msg"},
+            None,
+            is_subtask=True,
+        )[0]
+        parent_finish = stream._handle_part(
+            state, {"type": "step-finish", "id": "parent-end", "messageID": "parent-msg"}, None
+        )[0]
+        child_finish = stream._handle_part(
+            state,
+            {"type": "step-finish", "id": "child-end", "messageID": "child-msg"},
+            None,
+            is_subtask=True,
+        )[0]
+        assert parent_finish["stepId"] == parent_start["stepId"]
+        assert child_finish["stepId"] == child_start["stepId"]
+
+    def test_step_finish_without_start_has_nonempty_id(self, bridge: AgentBridge):
+        event = bridge.harness.prompt_stream._handle_part(
+            make_state("cp-message-123"), {"type": "step-finish", "id": "finish-only"}, None
+        )[0]
+        assert event["stepId"] == "finish-only"
+
+    def test_parts_without_ids_get_nonempty_matching_step_ids(self, bridge: AgentBridge):
+        stream = bridge.harness.prompt_stream
+        state = make_state("cp-message-123")
+        start = stream._handle_part(state, {"type": "step-start"}, None)[0]
+        finish = stream._handle_part(state, {"type": "step-finish"}, None)[0]
+        unmatched = stream._handle_part(state, {"type": "step-finish"}, None)[0]
+        assert start["stepId"] == finish["stepId"]
+        assert start["stepId"]
+        assert unmatched["stepId"]
+        assert unmatched["stepId"] != finish["stepId"]
+
     def test_text_part_uses_provided_message_id(self, bridge: AgentBridge):
         """Text parts should use the provided message_id, not any internal ID."""
-        stream = bridge._ensure_prompt_stream()
+        stream = bridge.harness.prompt_stream
         part = create_text_part("part-1", "Hello, world!")
 
         events = stream._handle_part(make_state("cp-message-123"), part, None)
 
         assert events == [
-            {"type": "token", "content": "Hello, world!", "messageId": "cp-message-123"}
+            {
+                "type": "token",
+                "content": "Hello, world!",
+                "messageId": "cp-message-123",
+                "partId": "part-1",
+            }
         ]
+
+    def test_text_parts_have_distinct_ids_and_cumulative_updates(self, bridge: AgentBridge):
+        stream = bridge.harness.prompt_stream
+        state = make_state("cp-message-123")
+        first = stream._handle_part(state, create_text_part("part-1", "Before tools"), None)[0]
+        stream._handle_part(state, create_tool_part("call-1", "Bash", "running"), None)
+        last = stream._handle_part(state, create_text_part("part-2", "After tools"), None)[0]
+        updated = stream._handle_part(state, create_text_part("part-1", "Before tools!"), None)[0]
+
+        assert [(event["partId"], event["content"]) for event in (first, last, updated)] == [
+            ("part-1", "Before tools"),
+            ("part-2", "After tools"),
+            ("part-1", "Before tools!"),
+        ]
+
+    def test_text_part_without_id_omits_part_id(self, bridge: AgentBridge):
+        event = bridge.harness.prompt_stream._handle_part(
+            make_state("cp-message-123"), {"type": "text", "text": "Hello"}, None
+        )[0]
+        assert "partId" not in event
 
     def test_empty_text_part_emits_nothing(self, bridge: AgentBridge):
         """Empty text parts should produce no events."""
-        stream = bridge._ensure_prompt_stream()
+        stream = bridge.harness.prompt_stream
         part = create_text_part("part-1", "")
 
         events = stream._handle_part(make_state("cp-message-123"), part, None)
@@ -150,16 +258,16 @@ class TestHandlePartTranslation:
 
     def test_step_start_part(self, bridge: AgentBridge):
         """Step-start parts should be transformed correctly."""
-        stream = bridge._ensure_prompt_stream()
+        stream = bridge.harness.prompt_stream
         part = {"type": "step-start", "id": "step-1"}
 
         events = stream._handle_part(make_state("cp-message-123"), part, None)
 
-        assert events == [{"type": "step_start", "messageId": "cp-message-123"}]
+        assert events == [{"type": "step_start", "messageId": "cp-message-123", "stepId": "step-1"}]
 
     def test_step_finish_part(self, bridge: AgentBridge):
         """Step-finish parts should include cost and token info."""
-        stream = bridge._ensure_prompt_stream()
+        stream = bridge.harness.prompt_stream
         part = {
             "type": "step-finish",
             "id": "step-1",
@@ -178,11 +286,12 @@ class TestHandlePartTranslation:
                 "tokens": 150,
                 "reason": "end_turn",
                 "messageId": "cp-message-123",
+                "stepId": "step-1",
             }
         ]
 
     def test_step_finish_omits_unknown_cost(self, bridge: AgentBridge):
-        stream = bridge._ensure_prompt_stream()
+        stream = bridge.harness.prompt_stream
         events = stream._handle_part(
             make_state("cp-message-123"),
             {"type": "step-finish", "id": "step-1", "cost": None, "tokens": 150},
@@ -192,9 +301,21 @@ class TestHandlePartTranslation:
         assert "cost" not in events[0]
         assert events[0]["messageCostUsd"] == 0.0
 
+    def test_step_finish_omits_unknown_tokens_and_reason(self, bridge: AgentBridge):
+        stream = bridge.harness.prompt_stream
+        events = stream._handle_part(
+            make_state("cp-message-123"),
+            {"type": "step-finish", "id": "step-1", "cost": 0.5},
+            None,
+        )
+
+        assert "tokens" not in events[0]
+        assert "reason" not in events[0]
+        assert events[0]["cost"] == 0.5
+
     def test_step_finish_reports_cumulative_turn_cost(self, bridge: AgentBridge):
         """Each step carries the turn total; a re-emitted part replaces its own cost."""
-        stream = bridge._ensure_prompt_stream()
+        stream = bridge.harness.prompt_stream
         state = make_state("cp-message-123")
 
         first = stream._handle_part(state, {"type": "step-finish", "id": "s1", "cost": 0.5}, None)
@@ -215,7 +336,7 @@ class TestBuildPromptRequestBody:
 
     def test_basic_prompt(self, bridge: AgentBridge):
         """Should build request with text content."""
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body("Hello", None)
+        body = bridge.harness.prompt_stream._build_prompt_request_body("Hello", None)
 
         assert body["parts"] == [{"type": "text", "text": "Hello"}]
         assert "model" not in body
@@ -225,15 +346,13 @@ class TestBuildPromptRequestBody:
         """Should include messageID when provided (expects OpenCode format)."""
         # The function now expects an already-formatted OpenCode ID
         opencode_id = "msg_0123456789abcdefABCDEF"
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body("Hello", None, opencode_id)
+        body = bridge.harness.prompt_stream._build_prompt_request_body("Hello", None, opencode_id)
 
         assert body["messageID"] == opencode_id
 
     def test_with_model_short_form(self, bridge: AgentBridge):
         """Should expand short model name to provider/model."""
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body(
-            "Hello", "claude-haiku-4-5"
-        )
+        body = bridge.harness.prompt_stream._build_prompt_request_body("Hello", "claude-haiku-4-5")
 
         assert body["model"] == {
             "providerID": "anthropic",
@@ -242,7 +361,7 @@ class TestBuildPromptRequestBody:
 
     def test_with_model_full_form(self, bridge: AgentBridge):
         """Should parse provider/model format."""
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body("Hello", "openai/gpt-4")
+        body = bridge.harness.prompt_stream._build_prompt_request_body("Hello", "openai/gpt-4")
 
         assert body["model"] == {
             "providerID": "openai",
@@ -252,7 +371,7 @@ class TestBuildPromptRequestBody:
     def test_with_all_options(self, bridge: AgentBridge):
         """Should include all options when provided."""
         opencode_id = "msg_0123456789abcdefABCDEF"
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body(
+        body = bridge.harness.prompt_stream._build_prompt_request_body(
             "Hello", "anthropic/claude-3-opus", opencode_id
         )
 
@@ -280,21 +399,21 @@ class TestBuildPromptRequestBody:
         ],
     )
     def test_reasoning_effort_uses_variant(self, bridge: AgentBridge, model: str, effort: str):
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body(
+        body = bridge.harness.prompt_stream._build_prompt_request_body(
             "Hello", model, reasoning_effort=effort
         )
         assert body["variant"] == effort
         assert set(body["model"]) == {"providerID", "modelID"}
 
     def test_no_effort_preserves_opencode_default(self, bridge: AgentBridge):
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body(
+        body = bridge.harness.prompt_stream._build_prompt_request_body(
             "Hello", "openai/gpt-5.6-sol"
         )
         assert "variant" not in body
         assert "options" not in body["model"]
 
     def test_with_xai_reasoning_effort(self, bridge: AgentBridge):
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body(
+        body = bridge.harness.prompt_stream._build_prompt_request_body(
             "Hello",
             "xai/grok-4.5",
             reasoning_effort="high",
@@ -304,7 +423,7 @@ class TestBuildPromptRequestBody:
         assert "options" not in body["model"]
 
     def test_with_grok_4_6_reasoning_effort(self, bridge: AgentBridge):
-        body = bridge._ensure_prompt_stream()._build_prompt_request_body(
+        body = bridge.harness.prompt_stream._build_prompt_request_body(
             "Hello",
             "xai/grok-4.6",
             reasoning_effort="medium",

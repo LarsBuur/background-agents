@@ -10,11 +10,13 @@ const BROWSER_USER_ID = "11111111111111111111111111111111";
 function automation(id: string, userId: string): AutomationRow {
   return {
     id,
+    owner_team_id: null,
     name: id,
     instructions: "Run tests",
     trigger_type: "schedule",
     schedule_cron: "0 9 * * *",
     schedule_tz: "UTC",
+    harness: "opencode",
     event_type: null,
     trigger_config: null,
     trigger_auth_data: null,

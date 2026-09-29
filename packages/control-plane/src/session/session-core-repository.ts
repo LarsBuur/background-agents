@@ -1,8 +1,17 @@
+import { DEFAULT_HARNESS, type HarnessId } from "@open-inspect/shared/harnesses";
 import type { SessionStatus, SpawnSource } from "@open-inspect/shared/types/sessions";
 import { buildSessionRepositories, type SessionRepositoryEntry } from "./repository-target";
-import type { SqlResult, SqlStorage, TransactionSync } from "./sql-storage";
-import type { SessionRepositoryRow, SessionRow } from "./types";
+import type { SqlStorage, TransactionSync } from "./sql-storage";
+import {
+  sessionRepositoryRowSchema,
+  sessionRowSchema,
+  SessionStorageIntegrityError,
+  type SessionRepositoryRow,
+  type SessionRow,
+} from "./types";
 import { DEFAULT_BASE_BRANCH } from "../repos/default-branch";
+
+const sessionCostRowSchema = sessionRowSchema.pick({ total_cost: true });
 
 /** Data for upserting a session. */
 export interface UpsertSessionData {
@@ -13,6 +22,8 @@ export interface UpsertSessionData {
   repoName: string | null;
   repoId?: number | null;
   baseBranch?: string | null;
+  /** Agent harness; fixed at create. Absent means the built-in harness. */
+  harness?: HarnessId;
   model: string;
   reasoningEffort?: string | null;
   status: SessionStatus;
@@ -48,24 +59,20 @@ export class SessionCoreRepository {
     private readonly transactionSync: TransactionSync
   ) {}
 
-  private rows<T>(result: SqlResult): T[] {
-    return result.toArray() as T[];
-  }
-
   transaction<T>(callback: () => T): T {
     return this.transactionSync(callback);
   }
 
   getSession(): SessionRow | null {
     const result = this.sql.exec(`SELECT * FROM session LIMIT 1`);
-    const rows = this.rows<SessionRow>(result);
-    return rows[0] ?? null;
+    const row = result.toArray()[0];
+    return row === undefined ? null : parseSessionRow(row);
   }
 
   /**
    * Writes the session row. On a repeat for the same id every named column
    * takes the new value; working state the aggregate accumulates elsewhere
-   * (branch_name, base_sha, current_sha, opencode_session_id, total_cost) is
+   * (branch_name, base_sha, current_sha, agent_session_id, total_cost) is
    * left as it stands.
    */
   upsertSession(data: UpsertSessionData): void {
@@ -82,8 +89,8 @@ export class SessionCoreRepository {
       // max_cost_usd is seeded on insert but absent from the update clause: once
       // setSessionBudget has written a live limit, it is working state like
       // branch_name and total_cost, and a repeated init must not reset it.
-      `INSERT INTO session (id, session_name, title, repo_owner, repo_name, repo_id, base_branch, model, reasoning_effort, status, parent_session_id, spawn_source, spawn_depth, code_server_enabled, vnc_enabled, sandbox_settings, environment_id, max_cost_usd, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO session (id, session_name, title, repo_owner, repo_name, repo_id, base_branch, harness, model, reasoning_effort, status, parent_session_id, spawn_source, spawn_depth, code_server_enabled, vnc_enabled, sandbox_settings, environment_id, max_cost_usd, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET
          session_name = excluded.session_name,
          title = excluded.title,
@@ -91,6 +98,7 @@ export class SessionCoreRepository {
          repo_name = excluded.repo_name,
          repo_id = excluded.repo_id,
          base_branch = excluded.base_branch,
+         harness = excluded.harness,
          model = excluded.model,
          reasoning_effort = excluded.reasoning_effort,
          status = excluded.status,
@@ -110,6 +118,7 @@ export class SessionCoreRepository {
       data.repoName,
       data.repoId ?? null,
       data.baseBranch ?? (hasRepoOwner ? DEFAULT_BASE_BRANCH : null),
+      data.harness ?? DEFAULT_HARNESS,
       data.model,
       data.reasoningEffort ?? null,
       data.status,
@@ -170,7 +179,7 @@ export class SessionCoreRepository {
 
   updateSessionStatus(sessionId: string, status: SessionStatus, updatedAt: number): void {
     this.sql.exec(
-      `UPDATE session SET status = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE session SET status = ?, updated_at = ?, status_revision = status_revision + 1 WHERE id = ?`,
       status,
       updatedAt,
       sessionId
@@ -187,8 +196,11 @@ export class SessionCoreRepository {
         cost,
         updatedAt
       )
-      .one() as { total_cost: number };
-    return row.total_cost;
+      .one();
+    const parsed = sessionCostRowSchema.safeParse(row);
+    if (!parsed.success)
+      throw new SessionStorageIntegrityError("Malformed persisted session cost row");
+    return parsed.data.total_cost;
   }
 
   setSessionBudget(maxCostUsd: number | null, exhausted: boolean, updatedAt: number): void {
@@ -231,7 +243,7 @@ export class SessionCoreRepository {
 
   getSessionRepositoryRows(): SessionRepositoryRow[] {
     const result = this.sql.exec(`SELECT * FROM session_repositories ORDER BY position`);
-    return this.rows<SessionRepositoryRow>(result);
+    return result.toArray().map((row) => parseSessionRepositoryRow(row));
   }
 
   /**
@@ -297,4 +309,16 @@ export class SessionCoreRepository {
       }
     });
   }
+}
+
+function parseSessionRow(row: unknown): SessionRow {
+  const parsed = sessionRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new SessionStorageIntegrityError("Malformed persisted session row");
+}
+
+function parseSessionRepositoryRow(row: unknown): SessionRepositoryRow {
+  const parsed = sessionRepositoryRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new SessionStorageIntegrityError("Malformed persisted session repository row");
 }

@@ -1,6 +1,11 @@
 {
-  "runtimeVersion": "v64-global-git-identity",
-  "generation": 64,
+  "runtimeVersion": "v74-fork-attachment-documents",
+  "generation": 74,
   "minimumCompatibleGeneration": 62,
-  "minimumRebuildGeneration": 64
+  "minimumPreservationGeneration": 71,
+  "minimumRebuildGeneration": 74,
+  "harnessMinimumGeneration": {
+    "claude": 73,
+    "opencode": 73
+  }
 }

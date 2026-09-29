@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SELF, env } from "cloudflare:test";
 import { runInSessionDO } from "./session-do-access";
 import type { SessionDO } from "../../src/cloudflare/durable-object";
-import { ModelPreferencesStore } from "../../src/db/model-preferences";
 import { SessionIndexStore } from "../../src/db/session-index";
 import { cleanD1Tables } from "./cleanup";
 import { initNamedSessionDO, queryDO, seedMessage, seedSandboxAuth } from "./helpers";
@@ -24,12 +23,16 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
     environmentId?: string | null;
     model?: string;
     reasoningEffort?: string | null;
+    ownerTeamId?: string | null;
+    visibility?: "team" | "workspace" | "private";
   }) {
     const parentName = `parent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const store = new SessionIndexStore(env.DB);
     const now = Date.now();
     await store.create({
       id: parentName,
+      ownerTeamId: opts?.ownerTeamId ?? null,
+      visibility: opts?.visibility ?? "workspace",
       title: "Parent",
       repoOwner: "acme",
       repoName: "web-app",
@@ -47,6 +50,7 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
       providerAuth: [
         { provider: "openai", authMode: "legacy_scoped_oauth", selectionSource: "legacy_fallback" },
         { provider: "xai", authMode: "legacy_scoped_oauth", selectionSource: "legacy_fallback" },
+        { provider: "anthropic", authMode: "api_key", selectionSource: "api_key_fallback" },
       ],
       createdAt: now,
       updatedAt: now,
@@ -98,8 +102,21 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
     });
   }
 
+  async function seedEnabledModels(enabledModels: string[]): Promise<void> {
+    await env.DB.prepare(
+      "INSERT INTO model_preferences (id, enabled_models, updated_at) VALUES ('global', ?, ?)"
+    )
+      .bind(JSON.stringify(enabledModels), Date.now())
+      .run();
+  }
+
   it("spawns a child session with sandbox auth (201)", async () => {
+    await env.DB.prepare(
+      "INSERT INTO teams (id, slug, name, created_at, updated_at) VALUES ('team_child', 'child', 'Child', 1, 1)"
+    ).run();
     const { parentName, sandboxToken, store } = await setupParent({
+      ownerTeamId: "team_child",
+      visibility: "workspace",
       repoId: 12345,
       userId: "user-1",
       canonicalUserId: "canonical-abc123",
@@ -127,6 +144,8 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
     const child = await store.get(body.sessionId);
     expect(child).not.toBeNull();
     expect(child!.parentSessionId).toBe(parentName);
+    expect(child!.ownerTeamId).toBe("team_child");
+    expect(child!.visibility).toBe("workspace");
     expect(child!.spawnSource).toBe("agent");
     expect(child!.spawnDepth).toBe(1);
     expect(child!.repoOwner).toBe("acme");
@@ -200,7 +219,7 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
         user_id: "slack:U2",
         canonical_user_id: "canonical-user-2",
         scm_login: "second-user",
-        scm_access_token_encrypted: "second-access",
+        scm_access_token_encrypted: null,
       },
     ]);
   });
@@ -379,7 +398,7 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
   it("rejects a disabled model override for grandchildren", async () => {
     const { parentName, sandboxToken } = await setupParent();
 
-    await new ModelPreferencesStore(env.DB).setEnabledModels(["anthropic/claude-sonnet-4-6"]);
+    await seedEnabledModels(["anthropic/claude-sonnet-4-6"]);
 
     const childRes = await SELF.fetch(`https://test.local/sessions/${parentName}/children`, {
       method: "POST",
@@ -428,7 +447,7 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
       reasoningEffort: "xhigh",
     });
 
-    await new ModelPreferencesStore(env.DB).setEnabledModels(["anthropic/claude-haiku-4-5"]);
+    await seedEnabledModels(["anthropic/claude-haiku-4-5"]);
 
     const response = await SELF.fetch(`https://test.local/sessions/${parentName}/children`, {
       method: "POST",
@@ -504,6 +523,8 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
     for (let i = 0; i < 5; i++) {
       await store.create({
         id: `child-active-${i}-${Date.now()}`,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: `Active Child ${i}`,
         repoOwner: "acme",
         repoName: "web-app",
@@ -543,6 +564,8 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
     for (let i = 0; i < 15; i++) {
       await store.create({
         id: `child-total-${i}-${Date.now()}`,
+        ownerTeamId: null,
+        visibility: "workspace",
         title: `Child ${i}`,
         repoOwner: "acme",
         repoName: "web-app",
@@ -638,6 +661,8 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
     // Seed some children in D1
     await store.create({
       id: "child-list-1",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: "Child A",
       repoOwner: "acme",
       repoName: "web-app",
@@ -654,6 +679,8 @@ describe("POST /sessions/:parentId/children — spawn child", () => {
 
     await store.create({
       id: "child-list-2",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: "Child B",
       repoOwner: "acme",
       repoName: "web-app",

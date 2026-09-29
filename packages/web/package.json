@@ -34,7 +34,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
-    "next": "^16.3.0",
+    "next": "^16.3.5",
     "next-themes": "^0.4.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -56,16 +56,19 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
-    "@types/node": "^22.10.5",
+    "@types/node": "^24.0.0",
     "@types/react": "^19.0.6",
     "@types/react-dom": "^19.0.3",
-    "@vitest/coverage-v8": "^4.1.0",
+    "@vitest/coverage-v8": "^4.1.11",
     "autoprefixer": "^10.4.20",
     "jsdom": "^28.1.0",
     "postcss": "^8.5.25",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.0",
+    "vitest": "^4.1.11",
     "wrangler": "^4.103.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }

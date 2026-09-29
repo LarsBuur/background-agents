@@ -37,6 +37,8 @@ from claude_agent_sdk import (
 from ..attachment_processor import (
     MAX_SESSION_ATTACHMENTS_PER_MESSAGE,
     AttachmentProcessor,
+    HydratedSessionAttachment,
+    markdown_attachment_text,
 )
 from ..credentials.provider_credential_client import (
     RuntimeCredentialClient,
@@ -282,6 +284,17 @@ def _usage_tokens(usage: Mapping[str, Any] | None) -> dict[str, Any] | None:
     }
     tokens = {k: v for k, v in tokens.items() if v not in (None, {})}
     return tokens or None
+
+
+def _attachment_block(attachment: HydratedSessionAttachment) -> dict[str, Any]:
+    """The Anthropic content block that carries one attachment."""
+    mime_type = attachment["mimeType"]
+    if mime_type == "text/markdown":
+        return {"type": "text", "text": markdown_attachment_text(attachment)}
+    source = {"type": "base64", "media_type": mime_type, "data": attachment["content"]}
+    if mime_type == "application/pdf":
+        return {"type": "document", "source": source}
+    return {"type": "image", "source": source}
 
 
 class ClaudeHarness:
@@ -693,17 +706,7 @@ class ClaudeHarness:
 
     async def _user_messages(self, prompt: HarnessPrompt) -> AsyncIterator[dict[str, Any]]:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt.text}]
-        for attachment in prompt.attachments:
-            content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": attachment["mimeType"],
-                        "data": attachment["content"],
-                    },
-                }
-            )
+        content.extend(_attachment_block(attachment) for attachment in prompt.attachments)
         yield {
             "type": "user",
             "message": {"role": "user", "content": content},

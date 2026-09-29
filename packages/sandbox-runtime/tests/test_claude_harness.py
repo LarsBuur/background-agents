@@ -523,6 +523,34 @@ class TestTranslation:
         }
 
     @pytest.mark.asyncio
+    async def test_document_attachments_become_document_and_text_blocks(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path, turns=[[_result(0.0)]])
+        await h.harness.open()
+        await h.harness.create_session()
+        await _run(
+            h.harness,
+            HarnessPrompt(
+                message_id="m1",
+                text="read these",
+                attachments=(
+                    {"name": "doc.pdf", "mimeType": "application/pdf", "content": "QUJD"},
+                    # "# Hi" in base64
+                    {"name": "notes.md", "mimeType": "text/markdown", "content": "IyBIaQ=="},
+                ),
+            ),
+        )
+        content = h.client.queries[0][0]["message"]["content"]
+        assert content[1:] == [
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "QUJD"},
+            },
+            {"type": "text", "text": '<attachment name="notes.md">\n# Hi\n</attachment>'},
+        ]
+
+    @pytest.mark.asyncio
     async def test_subagent_activity_is_nested_and_its_text_dropped(self, tmp_path: Path) -> None:
         turn = [
             AssistantMessage(

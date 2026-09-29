@@ -847,11 +847,11 @@ class OpenCodePromptStream:
                                  and assistant responses will have parentID pointing to it.
             reasoning_effort: Optional reasoning effort level (e.g., "high", "max")
             attachments: Optional list of attachment dicts (type/name/url/content/mimeType)
-                         to forward as OpenCode file parts.
+                         to forward as OpenCode prompt parts.
         """
         parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
         parts.extend(
-            dict(part) for part in self._attachment_processor.build_file_parts(attachments)
+            dict(part) for part in self._attachment_processor.build_opencode_parts(attachments)
         )
         request_body: dict[str, Any] = {"parts": parts}
 

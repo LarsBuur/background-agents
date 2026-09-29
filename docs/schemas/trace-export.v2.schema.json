@@ -122,7 +122,14 @@
                         "name": { "type": "string", "minLength": 1, "maxLength": 255 },
                         "mimeType": {
                           "type": "string",
-                          "enum": ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                          "enum": [
+                            "image/png",
+                            "image/jpeg",
+                            "image/webp",
+                            "image/gif",
+                            "application/pdf",
+                            "text/markdown"
+                          ]
                         }
                       },
                       "required": ["attachmentId", "name", "mimeType"],

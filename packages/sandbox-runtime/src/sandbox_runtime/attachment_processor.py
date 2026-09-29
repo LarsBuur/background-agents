@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import html
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, Protocol, TypedDict, cast
@@ -57,6 +58,23 @@ class OpenCodeFilePart(TypedDict):
     mime: str
     filename: str
     url: str
+
+
+class OpenCodeTextPart(TypedDict):
+    type: str
+    text: str
+
+
+def markdown_attachment_text(attachment: HydratedSessionAttachment) -> str:
+    """Render a Markdown attachment as prompt text.
+
+    Model providers take images and PDFs as file inputs but reject
+    ``text/markdown`` ("functionality not supported"), so the document goes to
+    the model as text instead.
+    """
+    body = base64.b64decode(attachment["content"]).decode("utf-8", errors="replace")
+    name = html.escape(attachment["name"], quote=True)
+    return f'<attachment name="{name}">\n{body}\n</attachment>'
 
 
 def parse_session_attachments(
@@ -197,12 +215,15 @@ class AttachmentProcessor:
     def _attachment_url(self, attachment_id: str) -> str:
         return f"{self.control_plane_url}/sessions/{self.session_id}/attachments/{attachment_id}"
 
-    def build_file_parts(
+    def build_opencode_parts(
         self, attachments: list[HydratedSessionAttachment] | None
-    ) -> list[OpenCodeFilePart]:
-        """Convert resolved attachments into OpenCode file parts."""
-        parts: list[OpenCodeFilePart] = []
+    ) -> list[OpenCodeFilePart | OpenCodeTextPart]:
+        """Convert resolved attachments into OpenCode prompt parts."""
+        parts: list[OpenCodeFilePart | OpenCodeTextPart] = []
         for attachment in attachments or []:
+            if attachment["mimeType"] == "text/markdown":
+                parts.append({"type": "text", "text": markdown_attachment_text(attachment)})
+                continue
             parts.append(
                 {
                     "type": "file",

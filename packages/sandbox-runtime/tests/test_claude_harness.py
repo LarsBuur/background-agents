@@ -16,6 +16,8 @@ import pytest
 from claude_agent_sdk import (
     AssistantMessage,
     ConversationResetMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
     RateLimitEvent,
     RateLimitInfo,
     StreamEvent,
@@ -183,7 +185,7 @@ class TestOptions:
         assert options["cli_path"] == str(h.harness.wrapper_path)
         assert options["model"] == "claude-sonnet-5-5"
         assert options["effort"] == "high"
-        assert options["permission_mode"] == "dontAsk"
+        assert options["permission_mode"] == "default"
         assert options["disallowed_tools"] == ["AskUserQuestion"]
         assert json.loads(options["settings"]) == {
             "attribution": {"commit": "", "pr": "", "sessionUrl": False},
@@ -208,6 +210,31 @@ class TestOptions:
         assert "mcp__linear__*" in options["allowed_tools"]
         assert "mcp__local__*" in options["allowed_tools"]
         assert "Bash" in options["allowed_tools"]
+
+    async def test_approves_listed_tools_the_repo_settings_would_prompt_for(
+        self, tmp_path: Path
+    ) -> None:
+        """A repo `ask` rule must not block the agent; unlisted tools stay denied.
+
+        In `dontAsk` mode a team's "prompt before git commit" rule became a
+        denial nobody could lift, so agents edited files but never committed.
+        """
+        h = Harness(tmp_path, mcp_servers=({"name": "linear", "type": "remote", "url": "u"},))
+        await h.harness.open()
+        await h.harness.create_session()
+        await _run(h.harness, HarnessPrompt(message_id="m1", text="hi", model=None))
+        can_use_tool = h.client.options["can_use_tool"]
+
+        async def decide(tool: str) -> object:
+            return await can_use_tool(tool, {"command": "git commit -m x"}, None)
+
+        assert isinstance(await decide("Bash"), PermissionResultAllow)
+        assert isinstance(await decide("Edit"), PermissionResultAllow)
+        assert isinstance(await decide("mcp__linear__create_issue"), PermissionResultAllow)
+        denied = await decide("EnterWorktree")
+        assert isinstance(denied, PermissionResultDeny)
+        assert "EnterWorktree" in denied.message
+        assert isinstance(await decide("mcp__other__tool"), PermissionResultDeny)
 
     async def test_stdout_ceiling_clears_the_whole_attachment_budget(self, tmp_path: Path) -> None:
         """One NDJSON line carries every attachment the runtime accepts.

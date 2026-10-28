@@ -424,7 +424,7 @@ class OpenCodeServer:
 
         memory_file = memory_path(resolve_opencode_global_config_dir())
         if memory_file.is_file() and memory_file.stat().st_size:
-            opencode_config["instructions"] = [str(memory_file)]
+            opencode_config["instructions"].append(str(memory_file))
 
         # Inject MCP servers
         mcp_servers = self._resolve_mcp_servers()

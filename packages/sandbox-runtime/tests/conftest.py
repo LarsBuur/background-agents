@@ -43,7 +43,7 @@ def isolate_sandbox_credentials(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def isolate_runtime_file_paths(tmp_path, monkeypatch):
+def isolate_runtime_file_paths(tmp_path, tmp_path_factory, monkeypatch):
     """Redirect the runtime's fixed file paths to per-test locations.
 
     This suite routinely runs inside a live Open-Inspect sandbox (agents
@@ -69,8 +69,8 @@ def isolate_runtime_file_paths(tmp_path, monkeypatch):
     monkeypatch.setattr("sandbox_runtime.tunnel_environment.TUNNEL_ENV_FILE_PATH", tunnel_env_path)
     # The signing runtime writes the author identity with ``git config --global``;
     # keep that out of the real ~/.gitconfig.
-    home = tmp_path / "home"
-    home.mkdir()
+    # Outside tmp_path, which some tests expect to stay empty.
+    home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)

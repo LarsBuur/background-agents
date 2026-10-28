@@ -18,6 +18,7 @@ from sandbox_runtime.memories import (
     memory_text,
 )
 from sandbox_runtime.memory_contract import MEMORY_TOOL_SPECS, RENDERED_MEMORY_MAX_CHARS
+from sandbox_runtime.opencode_server import RUNTIME_INSTRUCTIONS_PATH
 
 MANIFEST_SHA256 = "a" * 64
 
@@ -310,10 +311,13 @@ async def test_both_harnesses_receive_exact_memory_and_empty_parity(tmp_path, mo
     ):
         await server.start((), tmp_path)
     config = json.loads(spawn.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+    # The fork always loads its runtime rules; memory is appended after them.
+    assert config["instructions"][0] == str(RUNTIME_INSTRUCTIONS_PATH)
+    memory_files = config["instructions"][1:]
     if text:
-        assert [Path(path).read_text() for path in config["instructions"]] == [text]
+        assert [Path(path).read_text() for path in memory_files] == [text]
     else:
-        assert "instructions" not in config
+        assert memory_files == []
     with (
         patch(
             "sandbox_runtime.harness.ClaudeHarnessHandoff.read",

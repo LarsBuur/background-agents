@@ -60,6 +60,9 @@ resource "local_file" "web_app_wrangler_production" {
     main = ".open-next/worker.js"
     compatibility_date = "2025-08-15"
     compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+    # Keep-names makes esbuild emit __name() calls, which leak into next-themes'
+    # inline script and throw in the browser.
+    keep_names = false
 
     # Auth (GitHub OAuth, NEXTAUTH_URL, and the ALLOWED_* access-control set)
     # now lives entirely in the control plane; the web worker is a thin client.

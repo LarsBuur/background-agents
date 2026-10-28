@@ -2,8 +2,12 @@
 
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 import { WEB_SESSION_ATTACHMENT_IMAGE_MAX_BYTES } from "@/lib/session-attachment-limits";
 import {
+  ATTACHMENT_ACCEPT,
   SESSION_ATTACHMENT_UPLOAD_TIMEOUT_MS,
   useSessionAttachments,
 } from "./use-session-attachments";
@@ -13,6 +17,27 @@ describe("useSessionAttachments", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  it("toasts the server reason_code when an attachment upload is denied", async () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:image");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({ error: "Forbidden", reason_code: "session_read_only" }, { status: 403 })
+      )
+    );
+    const { result } = renderHook(() => useSessionAttachments());
+    act(() => result.current.addFiles([new File(["image"], "shot.png", { type: "image/png" })]));
+    await act(async () => {
+      await expect(result.current.uploadAll("session-1")).rejects.toThrow(
+        "Failed to upload shot.png (session_read_only)"
+      );
+    });
+    expect(toast.error).toHaveBeenCalledWith("Failed to upload shot.png (session_read_only)");
+    expect(result.current.attachments).toHaveLength(1);
   });
 
   it("rejects video files before creating a preview", () => {
@@ -69,6 +94,30 @@ describe("useSessionAttachments", () => {
       expect(result.current.attachmentError).toBeNull();
     }
   );
+
+  it.each([
+    ["data.json", "application/json"],
+    ["data.json", "text/plain"],
+    ["data.json", ""],
+    ["page.html", "text/html"],
+    ["page.htm", ""],
+  ])("accepts %s reported as %j", (fileName, declaredType) => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:text");
+    const { result } = renderHook(() => useSessionAttachments());
+
+    act(() => {
+      result.current.addFiles([new File(["{}"], fileName, { type: declaredType })]);
+    });
+
+    expect(result.current.attachments).toHaveLength(1);
+    expect(result.current.attachmentError).toBeNull();
+  });
+
+  it("offers JSON and HTML in the file picker", () => {
+    expect(ATTACHMENT_ACCEPT.split(",")).toEqual(
+      expect.arrayContaining(["application/json", "text/html", ".json", ".html", ".htm"])
+    );
+  });
 
   it("rejects a plain text file that is not markdown", () => {
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:txt");

@@ -1,13 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
-import {
-  buildFollowUpPrompt,
-  buildPrompt,
-  buildPromptContextPrompt,
-  escapeHtml,
-  handleAgentSessionEvent,
-} from "./webhook-handler";
-import { clearEnvironmentsLocalCache } from "./environments";
-import { clearReposLocalCache } from "./classifier/repos";
+import { handleAgentSessionEvent } from "./webhook-handler";
+import { buildFollowUpPrompt, buildPrompt, buildPromptContextPrompt, escapeHtml } from "./prompts";
 import type { Environment } from "@open-inspect/shared/types/environments";
 import { MAX_SESSION_INSTRUCTIONS_LENGTH } from "@open-inspect/shared/types/integrations";
 import { MAX_WEB_PROMPT_CHARS } from "@open-inspect/shared/types/prompts";
@@ -187,8 +180,6 @@ describe("handleAgentSessionEvent environment targets", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    clearEnvironmentsLocalCache();
-    clearReposLocalCache();
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -250,18 +241,29 @@ describe("handleAgentSessionEvent environment targets", () => {
 
   function stubControlPlane(
     env: Env,
-    options: { instructions?: string; promptResponse?: Response } = {}
+    options: {
+      instructions?: string;
+      promptResponse?: Response;
+      bindingResponse?: Response;
+      createResponse?: Response;
+      catalogResponse?: Response;
+    } = {}
   ) {
     const fetchMock = (env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> }).fetch;
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url === "https://internal/environments") {
+      const url = new URL(String(input));
+      const path = `${url.origin}${url.pathname}`;
+      if (url.pathname.startsWith("/channel-bindings/linear/")) {
+        return options.bindingResponse ?? Response.json({ teamId: null });
+      }
+      if (path === "https://internal/environments") {
+        if (options.catalogResponse) return options.catalogResponse;
         return {
           ok: true,
           json: () => Promise.resolve({ environments: [environment], total: 1 }),
         };
       }
-      if (url.startsWith("https://internal/integration-settings/linear/resolved/")) {
+      if (path.startsWith("https://internal/integration-settings/linear/resolved/")) {
         return {
           ok: true,
           json: () =>
@@ -280,16 +282,17 @@ describe("handleAgentSessionEvent environment targets", () => {
             }),
         };
       }
-      if (url === "https://internal/sessions") {
+      if (path === "https://internal/sessions") {
+        if (options.createResponse) return options.createResponse;
         return {
           ok: true,
           json: () => Promise.resolve({ sessionId: "session-xyz", status: "created" }),
         };
       }
-      if (url === "https://internal/sessions/session-xyz/prompt") {
+      if (path === "https://internal/sessions/session-xyz/prompt") {
         return options.promptResponse ?? { ok: true, json: () => Promise.resolve({ ok: true }) };
       }
-      if (url === "https://internal/repos") {
+      if (path === "https://internal/repos") {
         return { ok: true, json: () => Promise.resolve({ repos: [] }) };
       }
       throw new Error(`Unexpected control-plane fetch to ${url}`);
@@ -321,7 +324,10 @@ describe("handleAgentSessionEvent environment targets", () => {
     const env = makeLinearBotEnv(kv);
     const fetchMock = stubControlPlane(env);
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input);
+      const url = String(input).split("?")[0];
+      if (url.startsWith("https://internal/channel-bindings/linear/")) {
+        return Response.json({ teamId: null });
+      }
       if (url === "https://internal/environments") {
         return Response.json({ environments: [environment], total: 1 });
       }
@@ -362,7 +368,9 @@ describe("handleAgentSessionEvent environment targets", () => {
       .fetch;
     controlPlaneFetch.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/events?type=token&limit=20")) return eventsResponse;
+      if (url.endsWith("/actors/me")) return new Response(null, { status: 204 });
+      if (url.includes("/integration-settings/")) return Response.json({ config: null });
+      if (url.includes("/events?")) return eventsResponse;
       if (url.endsWith("/prompt")) return Response.json({ ok: true });
       throw new Error(`Unexpected control-plane fetch to ${url}`);
     });
@@ -411,7 +419,7 @@ describe("handleAgentSessionEvent environment targets", () => {
       .map(([input]) => String(input))
       .filter((url) => url.includes("/integration-settings/"));
     expect(settingsUrls).toEqual([
-      "https://internal/integration-settings/linear/resolved/acme/backend",
+      "https://internal/integration-settings/linear/resolved/acme/backend?channel=linear%3Ateam-1",
     ]);
 
     const issueSession = JSON.parse(store.get("issue:issue-1") ?? "null") as Record<
@@ -493,6 +501,30 @@ describe("handleAgentSessionEvent environment targets", () => {
     expect(createSessionBody(fetchMock)).toBeNull();
   });
 
+  it("refuses an unavailable bound environment mapping instead of falling back to a repository", async () => {
+    const { kv } = createFakeKV({
+      "oauth:client-credentials:org-1": validToken(),
+      "config:project-repos": JSON.stringify({ "project-1": { environmentId: "env_abc" } }),
+      "config:team-repos": JSON.stringify({ "team-1": [{ owner: "acme", name: "backend" }] }),
+    });
+    const env = makeLinearBotEnv(kv);
+    const fetchMock = stubControlPlane(env, {
+      bindingResponse: Response.json({ teamId: "team_internal", kind: "source" }),
+      catalogResponse: Response.json({ environments: [], total: 0 }),
+    });
+
+    await handleAgentSessionEvent(makeWebhook(), env, "trace-inaccessible-mapping");
+
+    expect(createSessionBody(fetchMock)).toBeNull();
+    expect(promptBody(fetchMock)).toBeNull();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.map(([, init]) => String(init?.body))
+        .join("\n")
+    ).toContain("repository grants");
+  });
+
   it("still creates repository sessions from repo mappings", async () => {
     const { kv, store } = createFakeKV({
       "oauth:client-credentials:org-1": validToken(),
@@ -526,6 +558,160 @@ describe("handleAgentSessionEvent environment targets", () => {
     > | null;
     expect(issueSession).toMatchObject({ repoOwner: "acme", repoName: "backend" });
     expect(issueSession).not.toHaveProperty("environmentId");
+  });
+
+  it.each([null, "team_internal"])(
+    "creates a session in the resolved ownership scope %s",
+    async (teamId) => {
+      const { kv, store } = createFakeKV({
+        "oauth:client-credentials:org-1": validToken(),
+        "config:team-repos": JSON.stringify({ "team-1": [{ owner: "acme", name: "backend" }] }),
+      });
+      const env = makeLinearBotEnv(kv);
+      const fetchMock = stubControlPlane(env, {
+        bindingResponse: Response.json(teamId ? { teamId, kind: "source" } : { teamId }),
+      });
+
+      await handleAgentSessionEvent(makeWebhook(), env, "trace-binding");
+
+      expect(createSessionBody(fetchMock)).toMatchObject({
+        teamId,
+        repoOwner: "acme",
+        repoName: "backend",
+      });
+      expect(createSessionBody(fetchMock)).not.toHaveProperty("visibility");
+      expect(promptBody(fetchMock)).toMatchObject({ callbackContext: { linearTeamId: "team-1" } });
+      expect(JSON.parse(store.get("issue:issue-1") ?? "null")).toMatchObject({
+        linearTeamId: "team-1",
+      });
+      const settingsRead = fetchMock.mock.calls.find(([input]) =>
+        String(input).includes("/integration-settings/")
+      );
+      expect(new Headers(settingsRead?.[1]?.headers).has("X-OpenInspect-Actor")).toBe(false);
+      const lookup = fetchMock.mock.calls.find(([input]) =>
+        new URL(String(input)).pathname.startsWith("/channel-bindings/")
+      );
+      expect(new URL(String(lookup?.[0])).pathname).toBe("/channel-bindings/linear/team-1");
+    }
+  );
+
+  it.each([
+    [404, { code: "channel_unbound" }, "Channels"],
+    [503, { error: "unavailable" }, "binding"],
+    [200, { teamId: 123 }, "binding"],
+  ])("refuses a failed or invalid binding lookup (%i)", async (status, body, message) => {
+    const { kv, store } = createFakeKV({ "oauth:client-credentials:org-1": validToken() });
+    const env = makeLinearBotEnv(kv);
+    const fetchMock = stubControlPlane(env, { bindingResponse: Response.json(body, { status }) });
+
+    await handleAgentSessionEvent(makeWebhook(), env, "trace-refused-binding");
+
+    expect(createSessionBody(fetchMock)).toBeNull();
+    expect(store.has("issue:issue-1")).toBe(false);
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.map(([, init]) => String(init?.body))
+        .join("\n")
+    ).toContain(message);
+  });
+
+  it("attests the installed app user's profile for an automation-created delegation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createLinearFetchMock({
+        identity: () => linearIdentityResponse(),
+        graphql: ({ body }) => {
+          if (String(body.query).includes("FetchUser")) {
+            expect(body.variables).toEqual({ id: "app-user-1" });
+            return Response.json({
+              data: { user: { id: "app-user-1", name: "Installed app", email: "app@corp.test" } },
+            });
+          }
+          return Response.json({ data: {} });
+        },
+      })
+    );
+    const { kv } = createFakeKV({
+      "oauth:client-credentials:org-1": validToken(),
+      "config:team-repos": JSON.stringify({ "team-1": [{ owner: "acme", name: "backend" }] }),
+    });
+    const env = makeLinearBotEnv(kv);
+    const fetchMock = stubControlPlane(env);
+    const webhook = makeWebhook();
+    webhook.agentSession.creatorId = null;
+
+    await handleAgentSessionEvent(webhook, env, "trace-app-profile");
+
+    expect(createSessionBody(fetchMock)).toMatchObject({
+      actorDisplayName: "Installed app",
+      actorEmail: "app@corp.test",
+    });
+  });
+
+  it.each([
+    ["not_member", "not a member"],
+    ["actor_admission_denied", "admission allowlists"],
+    ["actor_email_required", "email is unavailable"],
+  ])(
+    "posts %s without linking or prompting an app-user fallback session",
+    async (code, message) => {
+      const { kv, store } = createFakeKV({
+        "oauth:client-credentials:org-1": validToken(),
+        "config:team-repos": JSON.stringify({ "team-1": [{ owner: "acme", name: "backend" }] }),
+      });
+      const env = makeLinearBotEnv(kv);
+      const fetchMock = stubControlPlane(env, {
+        bindingResponse: Response.json({ teamId: "team_internal", kind: "primary" }),
+        createResponse: Response.json({ code }, { status: 403 }),
+      });
+      const webhook = makeWebhook();
+      webhook.agentSession.creatorId = null;
+
+      await handleAgentSessionEvent(webhook, env, "trace-app-not-member");
+
+      expect(createSessionBody(fetchMock)).toMatchObject({ teamId: "team_internal" });
+      const createCall = fetchMock.mock.calls.find(
+        ([input]) => String(input) === "https://internal/sessions"
+      );
+      expect(new Headers(createCall?.[1]?.headers).get("X-OpenInspect-Actor")).toBe(
+        "linear:app-user-1"
+      );
+      expect(promptBody(fetchMock)).toBeNull();
+      expect(store.has("issue:issue-1")).toBe(false);
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.map(([, init]) => String(init?.body))
+          .join("\n")
+      ).toContain(message);
+    }
+  );
+
+  it("names the refused repository when the target team lacks an environment member grant", async () => {
+    const { kv, store } = createFakeKV({
+      "oauth:client-credentials:org-1": validToken(),
+      "config:project-repos": JSON.stringify({ "project-1": { environmentId: "env_abc" } }),
+    });
+    const env = makeLinearBotEnv(kv);
+    const fetchMock = stubControlPlane(env, {
+      bindingResponse: Response.json({ teamId: "team_internal", kind: "primary" }),
+      createResponse: Response.json(
+        { code: "target_team_missing_grant", repository: "acme/frontend" },
+        { status: 409 }
+      ),
+    });
+
+    await handleAgentSessionEvent(makeWebhook(), env, "trace-missing-grant");
+
+    expect(store.has("issue:issue-1")).toBe(false);
+    expect(promptBody(fetchMock)).toBeNull();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.map(([, init]) => String(init?.body))
+        .join("\n")
+    ).toContain("acme/frontend");
   });
 
   it("sends a created event's top-level prompt context to the session", async () => {
@@ -727,7 +913,10 @@ describe("handleAgentSessionEvent environment targets", () => {
     const controlPlane = env.CONTROL_PLANE as unknown as { fetch: Mock };
     const fetchMock = controlPlane.fetch;
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input);
+      const url = String(input).split("?")[0];
+      if (url.startsWith("https://internal/channel-bindings/linear/")) {
+        return Response.json({ teamId: null });
+      }
       if (url === "https://internal/repos") {
         return {
           ok: true,
@@ -853,7 +1042,67 @@ describe("handleAgentSessionEvent environment targets", () => {
     expect(new Headers(init?.headers).get("X-OpenInspect-Actor")).toBe("linear:replier-user-2");
   });
 
-  it("attributes follow-up prompts to the human activity author", async () => {
+  it.each(["prompted", "stopped"])(
+    "stops %s after enrollment is denied and retains the session mapping",
+    async (action) => {
+      const { kv, store } = createFakeKV({
+        "oauth:client-credentials:org-1": validToken(),
+        "issue:issue-1": JSON.stringify({
+          sessionId: "session-xyz",
+          issueId: "issue-1",
+          issueIdentifier: "ENG-42",
+          model: "anthropic/claude-haiku-4-5",
+          createdAt: Date.now(),
+        }),
+      });
+      const env = makeLinearBotEnv(kv);
+      const controlPlaneFetch = (
+        env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> }
+      ).fetch;
+      controlPlaneFetch.mockResolvedValue(
+        Response.json({ code: "actor_admission_denied" }, { status: 403 })
+      );
+      if (action === "stopped") {
+        controlPlaneFetch.mockResolvedValueOnce(
+          Response.json({ code: "actor_email_required" }, { status: 403 })
+        );
+      }
+      const webhook = makeWebhook();
+      webhook.action = action;
+      webhook.agentActivity = {
+        userId: "new-collaborator",
+        content: { type: "prompt", body: "Please continue" },
+      };
+
+      await handleAgentSessionEvent(webhook, env, "trace-enrollment-denied");
+
+      expect(controlPlaneFetch.mock.calls.map(([url]) => String(url))).toEqual([
+        ...(action === "stopped"
+          ? ["https://internal/sessions/session-xyz/stop?channel=linear%3Ateam-1"]
+          : []),
+        "https://internal/actors/me",
+      ]);
+      const enrollmentInit = controlPlaneFetch.mock.calls.at(-1)?.[1] as RequestInit;
+      expect(new Headers(enrollmentInit.headers).get("X-OpenInspect-Actor")).toBe(
+        "linear:new-collaborator"
+      );
+      expect(store.has("issue:issue-1")).toBe(true);
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.map(([, init]) => String(init?.body))
+          .join("\n")
+      ).toContain("admission allowlists");
+    }
+  );
+
+  it("attributes a known actor's follow-up without fetching a stalled Linear profile", async () => {
+    const linearFetch = vi.mocked(fetch);
+    const dispatch = linearFetch.getMockImplementation()!;
+    linearFetch.mockImplementation((input, init) => {
+      if (String(init?.body).includes("FetchUser")) return new Promise<Response>(() => {});
+      return dispatch(input, init);
+    });
     const { kv } = createFakeKV({
       "oauth:client-credentials:org-1": validToken(),
       "issue:issue-1": JSON.stringify({
@@ -871,8 +1120,9 @@ describe("handleAgentSessionEvent environment targets", () => {
       .fetch;
     controlPlaneFetch.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.endsWith("/actors/me")) return new Response(null, { status: 204 });
       if (url.includes("/integration-settings/")) return Response.json({ config: null });
-      if (url.endsWith("/events?type=token&limit=20")) return Response.json({ events: [] });
+      if (url.includes("/events?")) return Response.json({ events: [] });
       if (url.endsWith("/prompt")) return Response.json({ ok: true });
       throw new Error(`Unexpected control-plane fetch to ${url}`);
     });
@@ -884,6 +1134,9 @@ describe("handleAgentSessionEvent environment targets", () => {
     };
 
     await handleAgentSessionEvent(webhook, env, "trace-follow-up");
+    expect(
+      linearFetch.mock.calls.some(([, init]) => String(init?.body).includes("FetchUser"))
+    ).toBe(false);
 
     const promptCall = controlPlaneFetch.mock.calls.find(([input]) =>
       String(input).endsWith("/prompt")
@@ -935,7 +1188,7 @@ describe("handleAgentSessionEvent environment targets", () => {
     controlPlaneFetch.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/integration-settings/")) return Response.json({ config: null });
-      if (url.endsWith("/events?type=token&limit=20")) return Response.json({ events: [] });
+      if (url.includes("/events?")) return Response.json({ events: [] });
       if (url.endsWith("/prompt")) return Response.json({ ok: true });
       throw new Error(`Unexpected control-plane fetch to ${url}`);
     });
@@ -991,41 +1244,105 @@ describe("handleAgentSessionEvent environment targets", () => {
     expect(body.content).not.toContain("Previous agent response");
   });
 
-  it("stops an existing session when Linear sends a stop signal", async () => {
-    const { kv, store } = createFakeKV({
-      "issue:issue-1": JSON.stringify({
-        sessionId: "session-xyz",
-        issueId: "issue-1",
-        issueIdentifier: "ENG-42",
-        model: "anthropic/claude-haiku-4-5",
-        createdAt: Date.now(),
-      }),
-    });
-    const env = makeLinearBotEnv(kv);
-    const controlPlaneFetch = (env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> })
-      .fetch;
-    controlPlaneFetch.mockResolvedValue(Response.json({ status: "stopping" }));
-    const webhook = makeWebhook();
-    webhook.action = "prompted";
-    webhook.agentActivity = {
-      userId: "follow-up-human-user",
-      signal: "stop",
-      content: { type: "prompt", body: "stop" },
-    };
+  it.each([200, 403, 503])(
+    "handles a stop response of %s without Linear API calls when credential issuance is unavailable",
+    async (status) => {
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Linear API unavailable")));
+      const { kv, store } = createFakeKV({
+        "issue:issue-1": JSON.stringify({
+          sessionId: "session-xyz",
+          issueId: "issue-1",
+          issueIdentifier: "ENG-42",
+          model: "anthropic/claude-haiku-4-5",
+          createdAt: Date.now(),
+        }),
+      });
+      const env = makeLinearBotEnv(kv);
+      const controlPlaneFetch = (
+        env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> }
+      ).fetch;
+      controlPlaneFetch.mockResolvedValue(
+        Response.json({ status: "stopping", code: "not_member" }, { status })
+      );
+      const webhook = makeWebhook();
+      webhook.action = "prompted";
+      webhook.agentActivity = {
+        userId: "follow-up-human-user",
+        signal: "stop",
+        content: { type: "prompt", body: "stop" },
+      };
 
-    await handleAgentSessionEvent(webhook, env, "trace-stop");
+      await handleAgentSessionEvent(webhook, env, "trace-stop");
 
-    expect(controlPlaneFetch).toHaveBeenCalledOnce();
-    expect(controlPlaneFetch).toHaveBeenCalledWith(
-      "https://internal/sessions/session-xyz/stop",
-      expect.objectContaining({ method: "POST" })
-    );
-    const stopInit = controlPlaneFetch.mock.calls[0]?.[1] as RequestInit | undefined;
-    expect(new Headers(stopInit?.headers).get("X-OpenInspect-Actor")).toBe(
-      "linear:follow-up-human-user"
-    );
-    expect(store.has("issue:issue-1")).toBe(false);
-  });
+      expect(controlPlaneFetch).toHaveBeenCalledOnce();
+      expect(controlPlaneFetch).toHaveBeenCalledWith(
+        "https://internal/sessions/session-xyz/stop?channel=linear%3Ateam-1",
+        expect.objectContaining({ method: "POST" })
+      );
+      const stopInit = controlPlaneFetch.mock.calls[0]?.[1] as RequestInit | undefined;
+      expect(new Headers(stopInit?.headers).get("X-OpenInspect-Actor")).toBe(
+        "linear:follow-up-human-user"
+      );
+      expect(store.has("issue:issue-1")).toBe(status !== 200);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([200, 403])(
+    "enrolls a new stop author before retrying and receiving %s",
+    async (status) => {
+      vi.stubGlobal(
+        "fetch",
+        createLinearFetchMock({
+          identity: () => linearIdentityResponse(),
+          graphql: () =>
+            Response.json({
+              data: { user: { id: "new-author", name: "Ada", email: "ada@corp.test" } },
+            }),
+        })
+      );
+      const { kv, store } = createFakeKV({
+        "oauth:client-credentials:org-1": validToken(),
+        "issue:issue-1": JSON.stringify({
+          sessionId: "session-xyz",
+          issueId: "issue-1",
+          issueIdentifier: "ENG-42",
+          model: "anthropic/claude-haiku-4-5",
+          createdAt: Date.now(),
+        }),
+      });
+      const env = makeLinearBotEnv(kv);
+      const controlPlaneFetch = (
+        env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> }
+      ).fetch;
+      controlPlaneFetch
+        .mockResolvedValueOnce(Response.json({ code: "actor_email_required" }, { status: 403 }))
+        .mockResolvedValueOnce(Response.json({ code: "actor_email_required" }, { status: 403 }))
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        .mockResolvedValueOnce(Response.json({ status: "stopping" }, { status }));
+      const webhook = makeWebhook();
+      webhook.agentActivity = { userId: "new-author", signal: "stop" };
+
+      await handleAgentSessionEvent(webhook, env, "trace-new-stop-author");
+
+      const stopUrl = "https://internal/sessions/session-xyz/stop?channel=linear%3Ateam-1";
+      expect(controlPlaneFetch.mock.calls.map(([url]) => String(url))).toEqual([
+        stopUrl,
+        "https://internal/actors/me",
+        "https://internal/actors/me",
+        stopUrl,
+      ]);
+      expect(JSON.parse(String(controlPlaneFetch.mock.calls[1]?.[1]?.body))).toEqual({});
+      expect(JSON.parse(String(controlPlaneFetch.mock.calls[2]?.[1]?.body))).toEqual({
+        displayName: "Ada",
+        email: "ada@corp.test",
+      });
+      for (const [, init] of controlPlaneFetch.mock.calls) {
+        expect(new Headers(init.headers).get("X-OpenInspect-Actor")).toBe("linear:new-author");
+      }
+      expect(store.has("issue:issue-1")).toBe(status !== 200);
+    }
+  );
 
   it("fails closed and retains the session mapping when a stop author is missing", async () => {
     const { kv, store } = createFakeKV({
@@ -1053,6 +1370,43 @@ describe("handleAgentSessionEvent environment targets", () => {
     expect(store.has("issue:issue-1")).toBe(true);
   });
 
+  it.each([
+    [
+      "the stored team when the webhook omits it",
+      "external-team-1",
+      "?channel=linear%3Aexternal-team-1",
+    ],
+    ["no channel for a legacy mapping without a team", undefined, ""],
+  ])("stops with %s", async (_label, storedTeamId, query) => {
+    const { kv, store } = createFakeKV({
+      "issue:issue-1": JSON.stringify({
+        sessionId: "session-xyz",
+        issueId: "issue-1",
+        issueIdentifier: "ENG-42",
+        model: "anthropic/claude-haiku-4-5",
+        createdAt: Date.now(),
+        ...(storedTeamId ? { linearTeamId: storedTeamId } : {}),
+      }),
+    });
+    const env = makeLinearBotEnv(kv);
+    const controlPlaneFetch = (env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> })
+      .fetch;
+    controlPlaneFetch.mockResolvedValue(Response.json({ status: "stopping" }));
+    const webhook = makeWebhook();
+    webhook.agentSession.issue = { id: "issue-1" } as typeof webhook.agentSession.issue;
+    webhook.agentActivity = { userId: "human-user-1", signal: "stop" };
+
+    await handleAgentSessionEvent(webhook, env, "trace-stop-team-missing");
+
+    expect(controlPlaneFetch).toHaveBeenCalledWith(
+      `https://internal/sessions/session-xyz/stop${query}`,
+      expect.objectContaining({ method: "POST" })
+    );
+    const stopInit = controlPlaneFetch.mock.calls[0]?.[1] as RequestInit | undefined;
+    expect(new Headers(stopInit?.headers).get("X-OpenInspect-Actor")).toBe("linear:human-user-1");
+    expect(store.has("issue:issue-1")).toBe(false);
+  });
+
   it("resolves current callback settings for an environment follow-up", async () => {
     const { kv } = createFakeKV({
       "oauth:client-credentials:org-1": validToken(),
@@ -1069,7 +1423,8 @@ describe("handleAgentSessionEvent environment targets", () => {
     const controlPlaneFetch = (env.CONTROL_PLANE as unknown as { fetch: ReturnType<typeof vi.fn> })
       .fetch;
     controlPlaneFetch.mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input);
+      const url = String(input).split("?")[0];
+      if (url.endsWith("/actors/me")) return new Response(null, { status: 204 });
       if (url === "https://internal/environments") {
         return Response.json({ environments: [environment], total: 1 });
       }
@@ -1086,7 +1441,7 @@ describe("handleAgentSessionEvent environment targets", () => {
           },
         });
       }
-      if (url.endsWith("/events?type=token&limit=20")) return Response.json({ events: [] });
+      if (url.endsWith("/events")) return Response.json({ events: [] });
       if (url.endsWith("/prompt")) return Response.json({ ok: true });
       throw new Error(`Unexpected control-plane fetch to ${url}`);
     });
@@ -1127,7 +1482,7 @@ describe("handleAgentSessionEvent environment targets", () => {
     controlPlaneFetch.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/integration-settings/")) return Response.json({ config: null });
-      if (url.endsWith("/events?type=token&limit=20")) return Response.json({ events: [] });
+      if (url.includes("/events?")) return Response.json({ events: [] });
       if (url.endsWith("/prompt")) return Response.json({ ok: true });
       throw new Error(`Unexpected control-plane fetch to ${url}`);
     });

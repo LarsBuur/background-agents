@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { getServerAuthSession } from "@/lib/server-auth-session";
 import { controlPlaneUserFetch } from "@/lib/control-plane";
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9-]+$/;
@@ -9,11 +8,6 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string; attachmentId: string }> }
 ) {
-  const session = await getServerAuthSession();
-  if (!session?.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   const { id: sessionId, attachmentId } = await params;
   if (!SESSION_ID_PATTERN.test(sessionId)) {
     return NextResponse.json({ error: "Invalid session ID" }, { status: 400 });
@@ -47,6 +41,12 @@ export async function GET(
       if (headerValue) {
         headers.set(headerName, headerValue);
       }
+    }
+    headers.set("X-Content-Type-Options", "nosniff");
+    if (headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() === "text/html") {
+      // User-uploaded HTML must never run as a page on the web app's origin.
+      headers.set("Content-Security-Policy", "sandbox; default-src 'none'");
+      headers.set("Content-Disposition", "attachment");
     }
 
     return new Response(response.body, {

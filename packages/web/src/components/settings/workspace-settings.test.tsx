@@ -2,6 +2,7 @@
 /// <reference types="@testing-library/jest-dom" />
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import * as matchers from "@testing-library/jest-dom/matchers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
@@ -23,6 +24,45 @@ afterEach(() => {
 });
 
 describe("WorkspaceSettings", () => {
+  it("offers account merging only with the merge permission", () => {
+    const administration = {
+      members: ["11111111111111111111111111111111", "22222222222222222222222222222222"].map(
+        (userId) => ({
+          userId,
+          displayName: null,
+          email: null,
+          suspendedAt: null,
+          role: { id: "role_builtin_member", key: "member" as const, name: "Member" },
+        })
+      ),
+      roles: [],
+      loading: false,
+      error: undefined,
+      refreshError: undefined,
+      updateMember: vi.fn(),
+      previewMerge: vi.fn(),
+      mergeMembers: vi.fn(),
+    };
+    vi.mocked(useWorkspaceAdministration).mockReturnValue(administration);
+    for (const canMerge of [false, true]) {
+      vi.mocked(useCurrentUserAuthorization).mockReturnValue({
+        authorization: null,
+        loading: false,
+        error: null,
+        hasPermission: (permission) =>
+          permission === "workspace.members.read" ||
+          (canMerge && permission === "workspace.members.merge"),
+      });
+
+      render(<WorkspaceSettings />);
+
+      expect(screen.queryAllByRole("button", { name: "Merge accounts" })).toHaveLength(
+        canMerge ? 1 : 0
+      );
+      cleanup();
+    }
+  });
+
   it("shows assigned role names to members-only readers", () => {
     vi.mocked(useCurrentUserAuthorization).mockReturnValue({
       authorization: null,
@@ -43,7 +83,10 @@ describe("WorkspaceSettings", () => {
       roles: [],
       loading: false,
       error: undefined,
+      refreshError: undefined,
       updateMember: vi.fn(),
+      previewMerge: vi.fn(),
+      mergeMembers: vi.fn(),
     });
 
     render(<WorkspaceSettings />);
@@ -85,7 +128,10 @@ describe("WorkspaceSettings", () => {
       ],
       loading: false,
       error: undefined,
+      refreshError: undefined,
       updateMember: vi.fn(),
+      previewMerge: vi.fn(),
+      mergeMembers: vi.fn(),
     });
 
     render(<WorkspaceSettings />);
@@ -116,7 +162,10 @@ describe("WorkspaceSettings", () => {
       roles: [],
       loading: false,
       error: undefined,
+      refreshError: undefined,
       updateMember,
+      previewMerge: vi.fn(),
+      mergeMembers: vi.fn(),
     });
 
     render(<WorkspaceSettings />);
@@ -128,6 +177,7 @@ describe("WorkspaceSettings", () => {
   });
 
   it("disables a member's role and status controls while their update is pending", async () => {
+    const user = userEvent.setup();
     let finishUpdate!: () => void;
     const updateMember = vi.fn(() => new Promise<void>((resolve) => (finishUpdate = resolve)));
     const member = {
@@ -168,14 +218,20 @@ describe("WorkspaceSettings", () => {
       ],
       loading: false,
       error: undefined,
+      refreshError: undefined,
       updateMember,
+      previewMerge: vi.fn(),
+      mergeMembers: vi.fn(),
     });
 
     render(<WorkspaceSettings />);
-    fireEvent.change(screen.getByRole("combobox"), {
-      target: { value: "role_builtin_administrator" },
-    });
+    await user.click(screen.getByRole("combobox", { name: "Role for Ada" }));
+    await user.click(await screen.findByRole("option", { name: "Administrator" }));
 
+    expect(updateMember).toHaveBeenCalledWith(member, {
+      kind: "role",
+      roleId: "role_builtin_administrator",
+    });
     await waitFor(() => expect(screen.getByRole("combobox")).toBeDisabled());
     expect(screen.getByRole("button", { name: "Suspend" })).toBeDisabled();
 

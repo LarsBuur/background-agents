@@ -34,6 +34,10 @@
     "packages/control-plane/src/db/user-merge.ts": {
       "json-function": {
         "occurrences": [
+          "json(",
+          "json_object(",
+          "json_object(",
+          "json_object(",
           "json_object(",
           "json_object(",
           "json_object(",
@@ -42,13 +46,19 @@
           "json_object(",
           "json_object("
         ],
-        "reason": "Merge audit payload, same constraint as authorization-store: before/after state is read inside the mutating batch. Postgres form is json_build_object."
+        "reason": "Merge audit payload, same constraint as authorization-store: before/after state (and, for a refused merge, the unchanged after state chosen by the in-batch decision) is read inside the mutating batch. Postgres form is json_build_object."
       }
     },
     "terraform/d1/migrations/0076_anthropic_provider_accounts.sql": {
       "create-trigger": {
         "occurrences": ["CREATE TRIGGER"],
         "reason": "sessions_seed_legacy_provider_auth (already in 0064, re-created with a third row) covers sessions the previous worker inserts between the migration and the new worker deploy, which the new worker rejects as incomplete without an anthropic row."
+      }
+    },
+    "terraform/d1/migrations/0085_team_default_visibility.sql": {
+      "create-trigger": {
+        "occurrences": ["CREATE TRIGGER", "CREATE TRIGGER"],
+        "reason": "Fence private team-default inserts and updates from the previous Worker between migration commit and deployment. New store validation cannot constrain old binaries; SQLite cannot narrow the existing CHECK in place, and rebuilding the referenced teams table risks deleting dependents. A Postgres migration would ALTER the CHECK instead."
       }
     }
   },

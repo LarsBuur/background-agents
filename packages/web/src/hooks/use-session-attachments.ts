@@ -3,14 +3,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MAX_SESSION_ATTACHMENTS_PER_MESSAGE,
-  SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS,
   SESSION_ATTACHMENT_MIME_TYPES,
+  SESSION_ATTACHMENT_TEXT_EXTENSIONS,
   normalizeSessionAttachmentMimeType,
   sessionAttachmentUploadResponseSchema,
   type SessionAttachmentReference,
 } from "@open-inspect/shared/types/session-attachments";
 import { WEB_SESSION_ATTACHMENT_IMAGE_MAX_BYTES } from "@/lib/session-attachment-limits";
 import { browserApiFetch } from "@/lib/browser-api-fetch";
+import { sessionActionErrorMessage } from "@/lib/session-action-error";
+import { toast } from "sonner";
 
 export type PendingAttachment = {
   id: string;
@@ -24,7 +26,7 @@ const SUPPORTED_MIME_TYPES: ReadonlySet<string> = new Set(SESSION_ATTACHMENT_MIM
 // don't always map to a MIME type (notably .md).
 export const ATTACHMENT_ACCEPT = [
   ...SUPPORTED_MIME_TYPES,
-  ...SESSION_ATTACHMENT_MARKDOWN_EXTENSIONS,
+  ...SESSION_ATTACHMENT_TEXT_EXTENSIONS,
 ].join(",");
 export const DEFAULT_ATTACHMENT_ONLY_MESSAGE = "See the attached files.";
 export const SESSION_ATTACHMENT_UPLOAD_TIMEOUT_MS = 60_000;
@@ -40,8 +42,9 @@ function parseUploadErrorMessage(value: unknown): string | null {
 }
 
 function isSupportedAttachment(file: File): boolean {
-  // Browsers label .md files inconsistently (text/plain, text/x-markdown, or
-  // nothing at all), so canonicalize by extension before checking. An empty
+  // Browsers label text files inconsistently (.md as text/plain or
+  // text/x-markdown, .json as text/json, or nothing at all), so canonicalize
+  // by extension before checking. An empty
   // type on any file is passed through; the server sniffs content and makes
   // the final call at the upload boundary.
   const mimeType = normalizeSessionAttachmentMimeType(file.type, file.name);
@@ -231,6 +234,15 @@ export function useSessionAttachments() {
           }
           assertCurrent();
           if (!response.ok) {
+            if (response.status === 403) {
+              const message = await sessionActionErrorMessage(
+                response,
+                `Failed to upload ${fileName}`
+              );
+              assertCurrent();
+              toast.error(message);
+              throw new Error(message);
+            }
             const message = parseUploadErrorMessage(await response.json().catch(() => null));
             throw new Error(message || `Failed to upload ${fileName}`);
           }

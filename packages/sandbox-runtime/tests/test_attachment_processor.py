@@ -116,7 +116,37 @@ def test_markdown_attachment_builds_text_part() -> None:
     assert parts == [
         {
             "type": "text",
-            "text": '<attachment name="my &quot;notes&quot;.md">\n# Plan\n\nShip it — æøå\n</attachment>',
+            "text": (
+                '<attachment name="my &quot;notes&quot;.md" type="text/markdown">\n'
+                "# Plan\n\nShip it — æøå\n</attachment>"
+            ),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "mime_type", "body"),
+    [
+        ("data.json", "application/json", '{"a": [1, 2]}'),
+        ("page.html", "text/html", "<p>Hi &amp; bye</p>"),
+    ],
+)
+def test_json_and_html_attachments_build_text_parts(name: str, mime_type: str, body: str) -> None:
+    processor = AttachmentProcessor(
+        control_plane_url="https://control.example",
+        session_id="session-1",
+        auth_token="token",
+        log=TestLogger(),
+        warn_user=_noop_warn,
+    )
+    content = base64.b64encode(body.encode()).decode("ascii")
+    parts = processor.build_opencode_parts(
+        [{"name": name, "mimeType": mime_type, "content": content}]
+    )
+    assert parts == [
+        {
+            "type": "text",
+            "text": f'<attachment name="{name}" type="{mime_type}">\n{body}\n</attachment>',
         }
     ]
 

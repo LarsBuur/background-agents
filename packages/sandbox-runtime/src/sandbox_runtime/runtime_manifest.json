@@ -1,11 +1,12 @@
 {
-  "runtimeVersion": "v74-fork-attachment-documents",
-  "generation": 74,
+  "runtimeVersion": "v80-fork-attachment-documents",
+  "generation": 80,
   "minimumCompatibleGeneration": 62,
   "minimumPreservationGeneration": 71,
-  "minimumRebuildGeneration": 74,
+  "minimumRebuildGeneration": 80,
   "harnessMinimumGeneration": {
-    "claude": 73,
-    "opencode": 73
+    "claude": 76,
+    "opencode": 76,
+    "codex": 79
   }
 }

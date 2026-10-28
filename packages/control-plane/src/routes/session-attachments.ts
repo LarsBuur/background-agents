@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { admit } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 /**
- * Session file attachments (images, PDFs, Markdown) added through the chat composer.
+ * Session file attachments (images, PDFs, Markdown, JSON, HTML) added through the chat composer.
  *
  * POST stores the file in the media bucket keyed by an unguessable attachment id;
  * the prompt then references it as `{ attachmentId, name }` so the message row and
@@ -114,8 +114,8 @@ export async function handleAttachmentPost(
     return error("Uploaded file is empty", 400);
   }
 
-  // Browsers disagree on the MIME type of .md files; fold the known aliases
-  // into text/markdown before validating the declared type.
+  // Browsers disagree on the MIME type of text files (.md, .json, .html); fold
+  // the known aliases into the canonical type before validating it.
   const declaredMimeType = normalizeSessionAttachmentMimeType(fileEntry.type, fileEntry.name ?? "");
   if (declaredMimeType && !isSupportedSessionAttachmentMimeType(declaredMimeType)) {
     return error("Unsupported attachment MIME type", 400);
@@ -126,7 +126,7 @@ export async function handleAttachmentPost(
   }
 
   const bytes = new Uint8Array(await fileEntry.arrayBuffer());
-  const detected = detectSessionAttachmentFileType(bytes);
+  const detected = detectSessionAttachmentFileType(bytes, declaredMimeType);
   if (!detected) {
     return error("Uploaded file is not a supported attachment format", 400);
   }

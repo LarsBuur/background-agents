@@ -1,6 +1,7 @@
 """Shared test fixtures and utilities for sandbox-runtime tests."""
 
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -23,7 +24,6 @@ SANDBOX_SESSION_ENV_VARS = (
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GITHUB_APP_TOKEN",
-    "OI_GITHUB_TOKEN_IS_FALLBACK",
 )
 
 
@@ -43,7 +43,7 @@ def isolate_sandbox_credentials(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def isolate_runtime_file_paths(tmp_path, monkeypatch):
+def isolate_runtime_file_paths(tmp_path, tmp_path_factory, monkeypatch):
     """Redirect the runtime's fixed file paths to per-test locations.
 
     This suite routinely runs inside a live Open-Inspect sandbox (agents
@@ -69,17 +69,19 @@ def isolate_runtime_file_paths(tmp_path, monkeypatch):
     monkeypatch.setattr("sandbox_runtime.tunnel_environment.TUNNEL_ENV_FILE_PATH", tunnel_env_path)
     # The signing runtime writes the author identity with ``git config --global``;
     # keep that out of the real ~/.gitconfig.
-    home = tmp_path / "home"
-    home.mkdir()
+    # Outside tmp_path, which some tests expect to stay empty.
+    home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(
         "sandbox_runtime.image_environment.IMAGE_ENVIRONMENT_PATH", image_environment_path
     )
-    # An image-build test would otherwise run the real OpenCode, which downloads
-    # the model catalog into the live session's cache.
-    monkeypatch.setattr("sandbox_runtime.supervisor.OPENCODE_MODELS_REFRESH_COMMAND", ("true",))
+    # Boot tests must never download a catalog into the live session's state.
+    monkeypatch.setenv("OPENCODE_MODELS_PATH", str(tmp_path / "models.json"))
+    monkeypatch.setattr(
+        "sandbox_runtime.supervisor.ensure_model_catalog", AsyncMock(return_value=True)
+    )
 
 
 def wire_opencode_transport(bridge: "AgentBridge", http_client: Any) -> Any:

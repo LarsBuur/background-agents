@@ -35,6 +35,12 @@ function buildObjectHeaders(source: ObjectStorageMetadata, contentType: string):
   const headers = new Headers();
   source.writeHttpMetadata(headers);
   headers.set("Content-Type", contentType);
+  headers.set("X-Content-Type-Options", "nosniff");
+  if (contentType === "text/html") {
+    // User-uploaded HTML must never run as a page on our origins.
+    headers.set("Content-Security-Policy", "sandbox; default-src 'none'");
+    headers.set("Content-Disposition", "attachment");
+  }
   headers.set("ETag", source.httpEtag);
   headers.set("Accept-Ranges", "bytes");
   return headers;

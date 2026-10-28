@@ -19,11 +19,12 @@ const PARAMS = {
 describe("session attachment download API route", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(getServerAuthSession).mockResolvedValue({ user: { id: "user-1" } } as never);
   });
 
-  it("rejects unauthenticated downloads before contacting the control plane", async () => {
-    vi.mocked(getServerAuthSession).mockResolvedValue(null);
+  it("preserves a control-plane 401 without a separate session lookup", async () => {
+    vi.mocked(controlPlaneUserFetch).mockResolvedValue(
+      Response.json({ error: "Unauthorized" }, { status: 401 })
+    );
 
     const response = await GET(
       new Request("http://localhost/api/sessions/session-1/attachments/attachment-1"),
@@ -31,8 +32,8 @@ describe("session attachment download API route", () => {
     );
 
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({ error: "Unauthorized" });
-    expect(controlPlaneUserFetch).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual({ error: "Failed to fetch attachment" });
+    expect(getServerAuthSession).not.toHaveBeenCalled();
   });
 
   it("forwards byte ranges and preserves storage response headers", async () => {
@@ -65,6 +66,24 @@ describe("session attachment download API route", () => {
     expect(response.status).toBe(206);
     expect(response.headers.get("Content-Range")).toBe("bytes 0-4/10");
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  it("serves uploaded HTML sandboxed and as a download", async () => {
+    vi.mocked(controlPlaneUserFetch).mockResolvedValue(
+      new Response("<script>alert(1)</script>", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      })
+    );
+
+    const response = await GET(
+      new Request("http://localhost/api/sessions/session-1/attachments/attachment-1"),
+      PARAMS
+    );
+
+    expect(response.headers.get("Content-Security-Policy")).toBe("sandbox; default-src 'none'");
+    expect(response.headers.get("Content-Disposition")).toBe("attachment");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
   it("does not reuse the encoded payload length for a decoded attachment stream", async () => {

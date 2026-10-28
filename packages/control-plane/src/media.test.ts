@@ -115,6 +115,20 @@ describe("media helpers", () => {
     });
   });
 
+  it("labels text attachments with the declared text type", () => {
+    const json = new TextEncoder().encode('{"a": 1}');
+    expect(detectSessionAttachmentFileType(json, "application/json")).toEqual({
+      mimeType: "application/json",
+      extension: "json",
+    });
+    const html = new TextEncoder().encode("<p>Hi</p>");
+    expect(detectSessionAttachmentFileType(html, "text/html")).toEqual({
+      mimeType: "text/html",
+      extension: "html",
+    });
+    expect(detectSessionAttachmentFileType(html, "image/png")?.mimeType).toBe("text/markdown");
+  });
+
   it("detects markdown/text attachments as text/markdown", () => {
     const markdown = new TextEncoder().encode("# Title\n\nSome **notes** with é unicode.\n");
     expect(detectSessionAttachmentFileType(markdown)).toEqual({

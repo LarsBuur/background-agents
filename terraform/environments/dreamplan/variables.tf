@@ -317,7 +317,7 @@ variable "linear_bot_default_model" {
 # =============================================================================
 
 variable "anthropic_api_key" {
-  description = "Deployment-wide Anthropic API key injected into Modal session sandboxes and OpenComputer sandboxes. Daytona, E2B and Vercel read model keys only from the scoped secret store, as do Modal image builds. Also serves the Slack and Linear bot classifiers when classification_anthropic_api_key is blank. Optional: leave blank to supply model credentials as scoped secrets, which override this value on every provider."
+  description = "Deployment-wide Anthropic API key injected into Modal session sandboxes. Daytona, E2B and Vercel read model keys only from the scoped secret store, as do Modal image builds. Also serves the Slack and Linear bot classifiers when classification_anthropic_api_key is blank. Optional: leave blank to supply model credentials as scoped secrets, which override this value on every provider."
   type        = string
   sensitive   = true
   default     = ""
@@ -338,8 +338,7 @@ variable "classification_anthropic_api_key" {
   validation {
     condition = (
       (var.enable_slack_bot == false && var.enable_linear_bot == false) ||
-      startswith(var.classification_model, "openai/") ||
-      startswith(var.classification_model, "gpt-") ||
+      local.classifier_provider != "anthropic" ||
       trimspace(var.classification_anthropic_api_key) != "" ||
       trimspace(var.anthropic_api_key) != ""
     )
@@ -348,21 +347,20 @@ variable "classification_anthropic_api_key" {
 }
 
 variable "classification_model" {
-  description = "Model backing the Slack and Linear bots' target classifiers. An \"anthropic/\"-prefixed or bare \"claude-\" id is served by classification_anthropic_api_key (falling back to anthropic_api_key); an \"openai/\"-prefixed or bare \"gpt-\" id is served by classification_openai_api_key."
+  description = "Model backing the Slack and Linear bots' target classifiers. An \"anthropic/\"-prefixed or bare \"claude-\" id is served by classification_anthropic_api_key (falling back to anthropic_api_key); an \"openai/\"-prefixed or bare \"gpt-\" id by classification_openai_api_key; a \"bedrock/<aws-region>/<inference-profile-id>\" id by classification_bedrock_api_key, through Claude in Amazon Bedrock in that Region."
   type        = string
   default     = "claude-haiku-4-5"
   nullable    = false
 
-  # Each prefix must be followed by an actual model id: a bare "claude-" or
-  # "openai/" satisfies startswith but names no model, and would reach the bots
-  # as a value their resolver accepts and then sends to the provider verbatim.
+  # Reads the constant pattern table, not local.classifier_provider: a
+  # variable's validation that references a local derived from the same
+  # variable is a dependency cycle.
   validation {
     condition = anytrue([
-      for prefix in ["anthropic/", "claude-", "openai/", "gpt-"] :
-      startswith(var.classification_model, prefix) &&
-      trimspace(substr(var.classification_model, length(prefix), -1)) != ""
+      for pattern in values(local.classifier_model_patterns) :
+      can(regex(pattern, var.classification_model))
     ])
-    error_message = "classification_model must be an Anthropic id (\"anthropic/...\" or \"claude-...\") or an OpenAI id (\"openai/...\" or \"gpt-...\"), naming a model after the prefix."
+    error_message = "classification_model must be an Anthropic id (\"anthropic/...\" or \"claude-...\") or an OpenAI id (\"openai/...\" or \"gpt-...\") naming a model after the prefix, or a Bedrock id (\"bedrock/<aws-region>/<inference-profile-id>\", such as \"bedrock/us-east-1/us.anthropic.claude-haiku-4-5-20251001-v1:0\")."
   }
 }
 
@@ -379,10 +377,55 @@ variable "classification_openai_api_key" {
   validation {
     condition = (
       (var.enable_slack_bot == false && var.enable_linear_bot == false) ||
-      !(startswith(var.classification_model, "openai/") || startswith(var.classification_model, "gpt-")) ||
+      local.classifier_provider != "openai" ||
       trimspace(var.classification_openai_api_key) != ""
     )
     error_message = "classification_openai_api_key must be non-blank when the Slack or Linear bot is enabled and classification_model is an OpenAI model."
+  }
+}
+
+variable "classification_bedrock_api_key" {
+  description = "Amazon Bedrock API key used by the Slack and Linear bot classifiers when classification_model is a \"bedrock/<aws-region>/<inference-profile-id>\" id; never injected into sandboxes. For the key type and IAM permissions it needs, see \"Classify on Amazon Bedrock (Optional)\" in docs/GETTING_STARTED.md."
+  type        = string
+  sensitive   = true
+  default     = ""
+  nullable    = false
+
+  # Fail closed once a deployed classifier is pointed at Bedrock: CI renders an
+  # unset secret as an empty string, which would otherwise deploy a
+  # credential-less classifier that rejects every message.
+  validation {
+    condition = (
+      (var.enable_slack_bot == false && var.enable_linear_bot == false) ||
+      local.classifier_provider != "bedrock" ||
+      trimspace(var.classification_bedrock_api_key) != ""
+    )
+    error_message = "classification_bedrock_api_key must be non-blank when the Slack or Linear bot is enabled and classification_model is a Bedrock model."
+  }
+}
+
+variable "classification_reasoning_effort" {
+  description = "Reasoning effort the Slack and Linear bot classifiers request from an OpenAI classification_model, sent as reasoning_effort (for example \"low\"). Blank sends none, so OpenAI applies the model's default."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  # Only the OpenAI transport sends reasoning_effort; an Anthropic or Bedrock
+  # classifier would silently ignore the setting.
+  validation {
+    condition = (
+      var.classification_reasoning_effort == "" ||
+      local.classifier_provider == "openai"
+    )
+    error_message = "classification_reasoning_effort applies only to an OpenAI classification_model. Leave it blank for an Anthropic or Bedrock model."
+  }
+
+  # Supported efforts differ by model, so OpenAI validates the value itself. A
+  # padded or mis-cased value would still reach it verbatim and fail every
+  # classification with HTTP 400, so reject anything but a lowercase word.
+  validation {
+    condition     = var.classification_reasoning_effort == "" || can(regex("^[a-z]+$", var.classification_reasoning_effort))
+    error_message = "classification_reasoning_effort must be blank or a lowercase OpenAI reasoning effort such as \"low\", with no surrounding whitespace."
   }
 }
 
@@ -540,10 +583,36 @@ variable "sandbox_provider" {
   }
 }
 
+variable "session_do_location_hint" {
+  description = "Best-effort Cloudflare location hint for new session Durable Objects; empty preserves automatic placement. Existing objects do not move."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "wnam", "enam", "sam", "weur", "eeur", "apac", "apac-ne", "apac-se", "oc", "afr", "me"], var.session_do_location_hint)
+    error_message = "session_do_location_hint must be empty or one of wnam, enam, sam, weur, eeur, apac, apac-ne, apac-se, oc, afr, me."
+  }
+}
+
 variable "sandbox_inactivity_timeout_ms" {
-  description = "Milliseconds of sandbox inactivity before OpenInspect snapshots and stops the sandbox when no clients are connected."
+  description = "Regular sandbox inactivity timeout in milliseconds before OpenInspect preserves and stops the sandbox when no session-page WebSocket clients are connected."
   type        = number
   default     = 600000
+}
+
+variable "sandbox_unattended_inactivity_timeout_ms" {
+  description = "Sandbox inactivity timeout in milliseconds for automation, github-bot, and agent sessions without session-page WebSocket clients. The effective timeout is the minimum of this and sandbox_inactivity_timeout_ms."
+  type        = number
+  default     = 120000
+
+  validation {
+    condition = (
+      var.sandbox_unattended_inactivity_timeout_ms >= 60000 &&
+      var.sandbox_unattended_inactivity_timeout_ms <= 9007199254740991 &&
+      floor(var.sandbox_unattended_inactivity_timeout_ms) == var.sandbox_unattended_inactivity_timeout_ms
+    )
+    error_message = "sandbox_unattended_inactivity_timeout_ms must be a whole number between 60000 and 9007199254740991 ms, matching the control plane's safe-integer range."
+  }
 }
 
 variable "teams_enforcement" {
@@ -576,6 +645,18 @@ variable "web_platform" {
   validation {
     condition     = contains(["vercel", "cloudflare"], var.web_platform)
     error_message = "web_platform must be 'vercel' or 'cloudflare'."
+  }
+}
+
+variable "web_serverless_region" {
+  description = "Vercel function region for the web project only; requires a web redeploy after apply. Unused when web_platform is cloudflare."
+  type        = string
+  # The live dreamplan project runs in Stockholm.
+  default = "arn1"
+
+  validation {
+    condition     = can(regex("^[a-z]{3}[0-9]$", var.web_serverless_region))
+    error_message = "web_serverless_region must be a Vercel region ID: three lowercase letters followed by one digit."
   }
 }
 
@@ -657,7 +738,7 @@ variable "r2_media_location" {
 }
 
 variable "r2_media_bucket_name" {
-  description = "Override the R2 media bucket name. Leave empty to use the default 'open-inspect-media-<deployment_name>'. Set this when the bucket must be pre-created out-of-band (e.g. when the Terraform credentials cannot create R2 buckets)."
+  description = "Name of the R2 media bucket Terraform creates and manages. Leave empty to use the default 'open-inspect-media-<deployment_name>'. Changing a managed bucket's name plans replacement, not an in-place rename. Cloudflare rejects deletion while objects remain; Terraform does not empty the bucket. An existing bucket must be imported into cloudflare_r2_bucket.media before applying. If that address already tracks another bucket, follow the migration steps in terraform.tfvars.example to migrate objects and replace the state entry first."
   type        = string
   default     = ""
 }

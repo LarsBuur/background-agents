@@ -13,6 +13,14 @@ import {
   type SandboxShutdownLifecycle,
 } from "./manager";
 import { COMPATIBLE_RUNTIME_VERSION } from "../../image-builds/test-helpers";
+import { createLogger } from "../../logger";
+import type { BackgroundTasks } from "../../platform-ports";
+import type { ImageBuildLookup } from "./image-selection";
+import {
+  SandboxAccess,
+  type SandboxAccessDependencies,
+  type SandboxAccessStorage,
+} from "./sandbox-access";
 import { SandboxShutdownCoordinator } from "../../session/sandbox-shutdown";
 import type { ShutdownRecord } from "../../session/sandbox-shutdown-repository";
 import type {
@@ -30,8 +38,15 @@ import type {
   StopConfig,
   StopResult,
 } from "../provider";
+import { providerResumesAfterStop } from "../provider";
 import type { SandboxAccessKind, SandboxRow, SessionRow } from "../../session/types";
 import type { SandboxStatus } from "@open-inspect/shared/types/sessions";
+
+/** A bridge heartbeat old enough to be past both the stale threshold and its reconnect grace. */
+export const EXPIRED_HEARTBEAT_AGE_MS =
+  DEFAULT_LIFECYCLE_CONFIG.heartbeat.timeoutMs +
+  DEFAULT_LIFECYCLE_CONFIG.heartbeat.reconnectGraceMs +
+  10_000;
 
 export function createMockSession(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -118,7 +133,7 @@ export function createMockStorage(
     | null = createMockSandbox(),
   userEnvVars: Record<string, string> | undefined = undefined,
   sessionRepositories: SessionRepositoryInfo[] = []
-): SandboxStorage & SessionContextReader & { calls: string[] } {
+): SandboxStorage & SandboxAccessStorage & SessionContextReader & { calls: string[] } {
   const calls: string[] = [];
 
   return {
@@ -449,6 +464,47 @@ export function createTestConfig(): SandboxLifecycleConfig {
   };
 }
 
+export function createTestLifecycleManager(
+  provider: SandboxProvider,
+  storage: SandboxStorage & SandboxAccessStorage,
+  sessionContext: SessionContextReader,
+  broadcaster: SandboxBroadcaster,
+  wsManager: WebSocketManager,
+  alarmScheduler: AlarmScheduler,
+  idGenerator: IdGenerator,
+  shutdown: SandboxShutdownLifecycle,
+  config: SandboxLifecycleConfig & Pick<SandboxAccessDependencies, "sandboxDashboardUrlBuilder">,
+  imageBuildLookup?: ImageBuildLookup,
+  backgroundTasks?: BackgroundTasks
+): SandboxLifecycleManager {
+  const access = new SandboxAccess({
+    storage,
+    broadcaster,
+    sockets: wsManager,
+    canResumeAfterStop: () => providerResumesAfterStop(provider),
+    getLogger: () => {
+      const log = createLogger("lifecycle-manager");
+      const sessionId = config.getSessionId?.();
+      return sessionId ? log.child({ session_id: sessionId }) : log;
+    },
+    sandboxDashboardUrlBuilder: config.sandboxDashboardUrlBuilder,
+  });
+  return new SandboxLifecycleManager(
+    provider,
+    storage,
+    sessionContext,
+    broadcaster,
+    wsManager,
+    alarmScheduler,
+    idGenerator,
+    shutdown,
+    access,
+    config,
+    imageBuildLookup,
+    backgroundTasks
+  );
+}
+
 export function createUnmanagedShutdown() {
   return {
     reserveStartup: vi.fn((_createdAt, _policy, persist) => persist()),
@@ -475,6 +531,10 @@ export function createUnmanagedShutdown() {
     prepared: vi.fn(),
     admissionDecision: vi.fn(() => "unmanaged" as const),
     handleAlarm: vi.fn(async () => "continue" as const),
+    rearmCaptureSettlement: vi.fn(async () => undefined),
+    recordRuntimeFailure: vi.fn(),
+    pendingRuntimeFailure: vi.fn(() => null),
+    clearRuntimeFailure: vi.fn(),
     recover: vi.fn(async () => undefined),
     snapshot: vi.fn(() => null),
   } satisfies SandboxShutdownLifecycle;
@@ -513,12 +573,16 @@ export function createCheckpointShutdown(
   } as never);
   return {
     ...createUnmanagedShutdown(),
-    captureCheckpoint: (generation, reason) => coordinator.captureCheckpoint(generation, reason),
+    captureCheckpoint: (generation, reason, after) =>
+      coordinator.captureCheckpoint(generation, reason, after),
     requestShutdown: (reason, mode) =>
       mode === "emergency"
         ? coordinator.requestShutdown(reason, mode)
         : Promise.resolve("unmanaged"),
     isHolding: () => coordinator.isHolding(),
+    recordRuntimeFailure: (reason) => coordinator.recordRuntimeFailure(reason),
+    pendingRuntimeFailure: () => coordinator.pendingRuntimeFailure(),
+    clearRuntimeFailure: () => coordinator.clearRuntimeFailure(),
     admissionDecision: () => coordinator.admissionDecision(),
     onRefusedReconnect: () => coordinator.onRefusedReconnect(),
   };
@@ -535,7 +599,7 @@ export function createAlarmFixture(
   const wsManager = createMockWebSocketManager(false, clientCount);
   const alarmScheduler = createMockAlarmScheduler();
   const shutdown = createCheckpointShutdown(provider, storage, broadcaster, onLifecycleChange);
-  const manager = new SandboxLifecycleManager(
+  const manager = createTestLifecycleManager(
     provider,
     storage,
     storage,

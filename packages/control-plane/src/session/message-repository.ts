@@ -10,7 +10,12 @@ import { z } from "zod";
 import type { CreateEventData, EventRepository } from "./event-repository";
 import type { SessionAttachmentRepository } from "./session-attachment-repository";
 import type { SqlResult, SqlStorage, TransactionSync } from "./sql-storage";
-import { messageRowSchema, SessionStorageIntegrityError, type MessageRow } from "./types";
+import {
+  messageRowSchema,
+  sessionRowSchema,
+  SessionStorageIntegrityError,
+  type MessageRow,
+} from "./types";
 import type { MessageListCursor } from "./message-cursor";
 
 type ExecutionCompleteEvent = Extract<SandboxEvent, { type: "execution_complete" }>;
@@ -22,6 +27,23 @@ const messageStopConfirmationRowSchema = messageRowSchema
   .pick({ id: true, stop_confirmation_deadline: true })
   .extend({ stop_confirmation_deadline: z.number() });
 const messageCreatedAtRowSchema = messageRowSchema.pick({ id: true, created_at: true });
+const messageReportedCostRowSchema = messageRowSchema.pick({ reported_cost_usd: true });
+const messageCallbackContextRowSchema = messageRowSchema.pick({
+  callback_context: true,
+  source: true,
+});
+const messageCancellationRowSchema = messageRowSchema.pick({
+  status: true,
+  source: true,
+  callback_context: true,
+});
+const messageCompletionStateRowSchema = z.object({
+  status: z.unknown().optional(),
+  created_at: z.number(),
+  started_at: z.number().nullable(),
+});
+const messageProcessingAuthorRowSchema = messageRowSchema.pick({ author_id: true });
+const sessionBudgetExhaustedRowSchema = sessionRowSchema.pick({ budget_exhausted: true });
 
 export interface RecordedMessageCompletion {
   messageId: string;
@@ -75,7 +97,6 @@ export interface AdmitAutofixMessageData {
   attemptLimit: number | null;
   windowStart: number;
   sessionClosed: boolean;
-  sandboxRecoveryRequired?: boolean;
 }
 
 export type AutofixMessageAdmission =
@@ -83,12 +104,7 @@ export type AutofixMessageAdmission =
   | { kind: "duplicate"; messageId: string }
   | {
       kind: "rejected";
-      reason:
-        | "session_closed"
-        | "sandbox_recovery_required"
-        | "budget_exhausted"
-        | "queue_full"
-        | "attempt_limit";
+      reason: "session_closed" | "budget_exhausted" | "queue_full" | "attempt_limit";
     };
 
 /** Options for listing messages. */
@@ -162,9 +178,11 @@ export class MessageRepository {
     // would only expose the post-update value.
     const rows = this.sql
       .exec(`SELECT reported_cost_usd FROM messages WHERE id = ?`, messageId)
-      .toArray() as Array<{ reported_cost_usd: number }>;
+      .toArray();
     if (rows.length !== 1) return 0;
-    const previous = rows[0].reported_cost_usd;
+    const parsed = messageReportedCostRowSchema.safeParse(rows[0]);
+    if (!parsed.success) throw new SessionStorageIntegrityError("Malformed persisted message row");
+    const previous = parsed.data.reported_cost_usd;
     if (reportedCostUsd <= previous) return 0;
     this.sql.exec(
       `UPDATE messages SET reported_cost_usd = ? WHERE id = ?`,
@@ -239,19 +257,15 @@ export class MessageRepository {
       if (existingMessageId) {
         return { kind: "duplicate", messageId: existingMessageId };
       }
-      const budget = (
-        this.sql.exec(`SELECT budget_exhausted FROM session LIMIT 1`).toArray() as Array<{
-          budget_exhausted: number;
-        }>
+      const budget = parseStorageRows(
+        this.sql.exec(`SELECT budget_exhausted FROM session LIMIT 1`).toArray(),
+        sessionBudgetExhaustedRowSchema
       )[0];
       if (budget?.budget_exhausted === 1) {
         return { kind: "rejected", reason: "budget_exhausted" };
       }
       if (data.sessionClosed) {
         return { kind: "rejected", reason: "session_closed" };
-      }
-      if (data.sandboxRecoveryRequired) {
-        return { kind: "rejected", reason: "sandbox_recovery_required" };
       }
       if (this.getPendingOrProcessingCount() >= MAX_UNFINISHED_PROMPTS) {
         return { kind: "rejected", reason: "queue_full" };
@@ -317,17 +331,12 @@ export class MessageRepository {
         `SELECT status, source, callback_context FROM messages WHERE id = ?`,
         messageId
       );
-      const message = (
-        result.toArray() as Array<{
-          status?: unknown;
-          source: string;
-          callback_context: string | null;
-        }>
-      )[0];
-      const status = parseMessageStatus(message?.status);
+      const rawMessage = result.toArray()[0];
+      const parsedMessage = messageCancellationRowSchema.safeParse(rawMessage);
+      if (!parsedMessage.success) return false;
+      const message = parsedMessage.data;
       if (
-        !message ||
-        status !== "pending" ||
+        message.status !== "pending" ||
         message.source !== "web" ||
         message.callback_context !== null
       ) {
@@ -351,10 +360,7 @@ export class MessageRepository {
       `SELECT callback_context, source FROM messages WHERE id = ?`,
       messageId
     );
-    const rows = result.toArray() as Array<{
-      callback_context: string | null;
-      source: string | null;
-    }>;
+    const rows = parseStorageRows(result.toArray(), messageCallbackContextRowSchema);
     return rows[0] ?? null;
   }
 
@@ -447,13 +453,7 @@ export class MessageRepository {
         `SELECT status, created_at, started_at FROM messages WHERE id = ?`,
         event.messageId
       );
-      const message = (
-        result.toArray() as Array<{
-          status?: unknown;
-          created_at: number;
-          started_at: number | null;
-        }>
-      )[0];
+      const message = parseStorageRows(result.toArray(), messageCompletionStateRowSchema)[0];
       const messageStatus = parseMessageStatus(message?.status);
       if (!message || messageStatus !== expectedStatus) return null;
 
@@ -525,7 +525,7 @@ export class MessageRepository {
     const result = this.sql.exec(
       `SELECT author_id FROM messages WHERE status = 'processing' LIMIT 1`
     );
-    const rows = result.toArray() as Array<{ author_id: string }>;
+    const rows = parseStorageRows(result.toArray(), messageProcessingAuthorRowSchema);
     return rows[0] ?? null;
   }
 }

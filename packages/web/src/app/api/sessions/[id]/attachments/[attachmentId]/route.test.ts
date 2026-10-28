@@ -68,6 +68,24 @@ describe("session attachment download API route", () => {
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
   });
 
+  it("serves uploaded HTML sandboxed and as a download", async () => {
+    vi.mocked(controlPlaneUserFetch).mockResolvedValue(
+      new Response("<script>alert(1)</script>", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      })
+    );
+
+    const response = await GET(
+      new Request("http://localhost/api/sessions/session-1/attachments/attachment-1"),
+      PARAMS
+    );
+
+    expect(response.headers.get("Content-Security-Policy")).toBe("sandbox; default-src 'none'");
+    expect(response.headers.get("Content-Disposition")).toBe("attachment");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+  });
+
   it("does not reuse the encoded payload length for a decoded attachment stream", async () => {
     vi.mocked(controlPlaneUserFetch).mockResolvedValue(
       new Response("decoded attachment", {

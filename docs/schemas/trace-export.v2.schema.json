@@ -128,7 +128,9 @@
                             "image/webp",
                             "image/gif",
                             "application/pdf",
-                            "text/markdown"
+                            "text/markdown",
+                            "application/json",
+                            "text/html"
                           ]
                         }
                       },

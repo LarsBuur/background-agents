@@ -23,7 +23,8 @@ from ..attachment_processor import (
     MAX_SESSION_ATTACHMENTS_PER_MESSAGE,
     AttachmentProcessor,
     HydratedSessionAttachment,
-    markdown_attachment_text,
+    is_text_attachment,
+    text_attachment_text,
 )
 from ..credentials.provider_credential_client import (
     RuntimeCredentialClient,
@@ -183,9 +184,9 @@ def mcp_server_options(servers: tuple[Mapping[str, Any], ...]) -> dict[str, Any]
 
 def _attachment_block(attachment: HydratedSessionAttachment) -> dict[str, Any]:
     """The Anthropic content block that carries one attachment."""
+    if is_text_attachment(attachment):
+        return {"type": "text", "text": text_attachment_text(attachment)}
     mime_type = attachment["mimeType"]
-    if mime_type == "text/markdown":
-        return {"type": "text", "text": markdown_attachment_text(attachment)}
     source = {"type": "base64", "media_type": mime_type, "data": attachment["content"]}
     if mime_type == "application/pdf":
         return {"type": "document", "source": source}

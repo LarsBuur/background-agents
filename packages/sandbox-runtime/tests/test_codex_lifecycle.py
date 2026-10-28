@@ -636,6 +636,33 @@ async def test_partially_written_attachment_is_removed(tmp_path, monkeypatch):
     assert list((h.config.state_dir / "openinspect-input").iterdir()) == []
 
 
+async def test_text_attachments_are_sent_inline_not_as_images(tmp_path):
+    h, client = build(tmp_path)
+    await h.open()
+    h.session_id = "thread"
+
+    async def request(method, params):
+        if method == "turn/start":
+            raise CodexTransportError("stop after submission")
+        return {"account": {"type": "apiKey"}}
+
+    client.request.side_effect = request
+    attachment = {
+        "name": "a.json",
+        "mimeType": "application/json",
+        "content": base64.b64encode(b'{"a":1}').decode(),
+    }
+    await h.run_prompt(HarnessPrompt("m", "look", attachments=(attachment,)), AsyncMock())
+    (submission,) = [
+        call.args[1] for call in client.request.call_args_list if call.args[0] == "turn/start"
+    ]
+    assert submission["input"][1] == {
+        "type": "text",
+        "text": '<attachment name="a.json" type="application/json">\n{"a":1}\n</attachment>',
+    }
+    assert not (h.config.state_dir / "openinspect-input").exists()
+
+
 async def test_generation_reauthentication_waits_for_the_stopped_turn_to_unwind(tmp_path):
     h, client = build(tmp_path)
     await h.open()

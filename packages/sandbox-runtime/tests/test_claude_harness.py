@@ -387,6 +387,8 @@ class TestTranslation:
                     {"name": "doc.pdf", "mimeType": "application/pdf", "content": "QUJD"},
                     # "# Hi" in base64
                     {"name": "notes.md", "mimeType": "text/markdown", "content": "IyBIaQ=="},
+                    # '{"a":1}' in base64
+                    {"name": "a.json", "mimeType": "application/json", "content": "eyJhIjoxfQ=="},
                 ),
             ),
         )
@@ -396,7 +398,14 @@ class TestTranslation:
                 "type": "document",
                 "source": {"type": "base64", "media_type": "application/pdf", "data": "QUJD"},
             },
-            {"type": "text", "text": '<attachment name="notes.md">\n# Hi\n</attachment>'},
+            {
+                "type": "text",
+                "text": '<attachment name="notes.md" type="text/markdown">\n# Hi\n</attachment>',
+            },
+            {
+                "type": "text",
+                "text": '<attachment name="a.json" type="application/json">\n{"a":1}\n</attachment>',
+            },
         ]
 
     @pytest.mark.asyncio

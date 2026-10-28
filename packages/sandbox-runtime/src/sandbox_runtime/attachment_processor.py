@@ -27,14 +27,18 @@ SessionAttachmentMimeType = Literal[
     "image/webp",
     "application/pdf",
     "text/markdown",
+    "application/json",
+    "text/html",
 ]
+# Formats the model reads inline as prompt text rather than as a file.
+TEXT_ATTACHMENT_MIME_TYPES = frozenset({"text/markdown", "application/json", "text/html"})
 SESSION_ATTACHMENT_MIME_TYPES = {
     "image/png",
     "image/jpeg",
     "image/gif",
     "image/webp",
     "application/pdf",
-    "text/markdown",
+    *TEXT_ATTACHMENT_MIME_TYPES,
 }
 MAX_SESSION_ATTACHMENTS_PER_MESSAGE = 6
 
@@ -65,16 +69,21 @@ class OpenCodeTextPart(TypedDict):
     text: str
 
 
-def markdown_attachment_text(attachment: HydratedSessionAttachment) -> str:
-    """Render a Markdown attachment as prompt text.
+def is_text_attachment(attachment: HydratedSessionAttachment) -> bool:
+    return attachment.get("mimeType") in TEXT_ATTACHMENT_MIME_TYPES
 
-    Model providers take images and PDFs as file inputs but reject
-    ``text/markdown`` ("functionality not supported"), so the document goes to
-    the model as text instead.
+
+def text_attachment_text(attachment: HydratedSessionAttachment) -> str:
+    """Render a text attachment (Markdown, JSON, HTML) as prompt text.
+
+    Model providers take images and PDFs as file inputs but reject text MIME
+    types such as ``text/markdown`` ("functionality not supported"), so the
+    document goes to the model as text instead.
     """
     body = base64.b64decode(attachment["content"]).decode("utf-8", errors="replace")
     name = html.escape(attachment["name"], quote=True)
-    return f'<attachment name="{name}">\n{body}\n</attachment>'
+    mime_type = html.escape(attachment["mimeType"], quote=True)
+    return f'<attachment name="{name}" type="{mime_type}">\n{body}\n</attachment>'
 
 
 def parse_session_attachments(
@@ -221,8 +230,8 @@ class AttachmentProcessor:
         """Convert resolved attachments into OpenCode prompt parts."""
         parts: list[OpenCodeFilePart | OpenCodeTextPart] = []
         for attachment in attachments or []:
-            if attachment["mimeType"] == "text/markdown":
-                parts.append({"type": "text", "text": markdown_attachment_text(attachment)})
+            if is_text_attachment(attachment):
+                parts.append({"type": "text", "text": text_attachment_text(attachment)})
                 continue
             parts.append(
                 {

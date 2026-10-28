@@ -42,6 +42,12 @@ export async function GET(
         headers.set(headerName, headerValue);
       }
     }
+    headers.set("X-Content-Type-Options", "nosniff");
+    if (headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() === "text/html") {
+      // User-uploaded HTML must never run as a page on the web app's origin.
+      headers.set("Content-Security-Policy", "sandbox; default-src 'none'");
+      headers.set("Content-Disposition", "attachment");
+    }
 
     return new Response(response.body, {
       status: response.status,

@@ -48,9 +48,13 @@ function attachmentUploadRequest(): Request {
   });
 }
 
-function markdownUploadRequest(declaredType: string, fileName = "notes.md"): Request {
+function markdownUploadRequest(
+  declaredType: string,
+  fileName = "notes.md",
+  body = "# Notes\n\nHello"
+): Request {
   const form = new FormData();
-  form.append("file", new File(["# Notes\n\nHello"], fileName, { type: declaredType }));
+  form.append("file", new File([body], fileName, { type: declaredType }));
   return new Request("https://test.local/sessions/session-1/attachments", {
     method: "POST",
     body: form,
@@ -107,6 +111,48 @@ describe("session attachment routes", () => {
       expect(put).toHaveBeenCalledTimes(1);
     }
   );
+
+  it.each([
+    ["data.json", "application/json", '{"a": 1}', "application/json"],
+    ["data.json", "text/plain", '{"a": 1}', "application/json"],
+    ["data.json", "", '{"a": 1}', "application/json"],
+    ["page.html", "text/html", "<p>Hi</p>", "text/html"],
+    ["page.htm", "application/octet-stream", "<p>Hi</p>", "text/html"],
+  ])("stores %s declared as %j as %s", async (fileName, declaredType, body, expected) => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const { env, put } = createEnv(fetch);
+
+    const response = await handleAttachmentPost(
+      markdownUploadRequest(declaredType, fileName, body),
+      env,
+      { id: "session-1" },
+      withSessionRuntime(env, createContext())
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({ mimeType: expected });
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a binary file declared as JSON", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const { env, put } = createEnv(fetch);
+    const form = new FormData();
+    form.append("file", new File([PNG_BYTES], "data.json", { type: "application/json" }));
+
+    const response = await handleAttachmentPost(
+      new Request("https://test.local/sessions/session-1/attachments", {
+        method: "POST",
+        body: form,
+      }),
+      env,
+      { id: "session-1" },
+      withSessionRuntime(env, createContext())
+    );
+
+    expect(response.status).toBe(400);
+    expect(put).not.toHaveBeenCalled();
+  });
 
   it("rejects a text/plain file that is not named as Markdown", async () => {
     const fetch = vi.fn(async () => Response.json({ status: "ok" }));

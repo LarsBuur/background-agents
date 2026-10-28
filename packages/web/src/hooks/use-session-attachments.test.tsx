@@ -7,6 +7,7 @@ import { toast } from "sonner";
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 import { WEB_SESSION_ATTACHMENT_IMAGE_MAX_BYTES } from "@/lib/session-attachment-limits";
 import {
+  ATTACHMENT_ACCEPT,
   SESSION_ATTACHMENT_UPLOAD_TIMEOUT_MS,
   useSessionAttachments,
 } from "./use-session-attachments";
@@ -93,6 +94,30 @@ describe("useSessionAttachments", () => {
       expect(result.current.attachmentError).toBeNull();
     }
   );
+
+  it.each([
+    ["data.json", "application/json"],
+    ["data.json", "text/plain"],
+    ["data.json", ""],
+    ["page.html", "text/html"],
+    ["page.htm", ""],
+  ])("accepts %s reported as %j", (fileName, declaredType) => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:text");
+    const { result } = renderHook(() => useSessionAttachments());
+
+    act(() => {
+      result.current.addFiles([new File(["{}"], fileName, { type: declaredType })]);
+    });
+
+    expect(result.current.attachments).toHaveLength(1);
+    expect(result.current.attachmentError).toBeNull();
+  });
+
+  it("offers JSON and HTML in the file picker", () => {
+    expect(ATTACHMENT_ACCEPT.split(",")).toEqual(
+      expect.arrayContaining(["application/json", "text/html", ".json", ".html", ".htm"])
+    );
+  });
 
   it("rejects a plain text file that is not markdown", () => {
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:txt");

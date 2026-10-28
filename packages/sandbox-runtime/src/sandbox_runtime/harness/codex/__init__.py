@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...attachment_processor import is_text_attachment, text_attachment_text
 from ...credentials.openai_access_token_client import (
     OPENAI_ACCESS_TOKEN_TIMEOUT_SECONDS,
     OpenAIAccessTokenClient,
@@ -396,6 +397,9 @@ class CodexHarness:
                 assert self._client is not None and self.session_id is not None
                 inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt.text}]
                 for attachment in prompt.attachments:
+                    if is_text_attachment(attachment):
+                        inputs.append({"type": "text", "text": text_attachment_text(attachment)})
+                        continue
                     directory = self.config.state_dir / "openinspect-input"
                     directory.mkdir(exist_ok=True, mode=0o700)
                     path = directory / uuid.uuid4().hex

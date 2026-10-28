@@ -2,6 +2,7 @@ import type { VideoArtifactMetadata } from "@open-inspect/shared/types/artifacts
 import {
   SESSION_ATTACHMENT_MAX_BYTES,
   SESSION_ATTACHMENT_MIME_TYPES,
+  isSessionAttachmentTextMimeType,
   type SessionAttachmentMimeType,
 } from "@open-inspect/shared/types/session-attachments";
 
@@ -126,17 +127,26 @@ export function sessionAttachmentRequestExceedsLimit(request: Request): boolean 
   return Number(raw) > SESSION_ATTACHMENT_MAX_REQUEST_BYTES;
 }
 
+const TEXT_ATTACHMENT_EXTENSIONS = {
+  "text/markdown": "md",
+  "application/json": "json",
+  "text/html": "html",
+} as const;
+
 /**
  * Detect user-attached prompt files by content. Binary formats (images, PDF)
- * are matched by magic bytes; Markdown has no signature, so it is recognized as
- * a last resort by validating the bytes decode as UTF-8 text. Ordering matters:
- * binary signatures are checked before the text fallback so a mislabeled binary
- * (e.g. a PNG declared as text/markdown) is caught by the declared-vs-detected
- * check at the upload boundary rather than passing as text. Videos are not
- * supported as session attachments.
+ * are matched by magic bytes; text formats (Markdown, JSON, HTML) have no
+ * signature, so text is recognized as a last resort by validating the bytes
+ * decode as UTF-8 and is labeled with the declared text type (Markdown when
+ * none was declared). Ordering matters: binary signatures are checked before
+ * the text fallback so a mislabeled binary (e.g. a PNG declared as
+ * text/markdown) is caught by the declared-vs-detected check at the upload
+ * boundary rather than passing as text. Videos are not supported as session
+ * attachments.
  */
 export function detectSessionAttachmentFileType(
-  bytes: Uint8Array
+  bytes: Uint8Array,
+  declaredMimeType = ""
 ): SessionAttachmentFileType | null {
   const image = detectScreenshotFileType(bytes);
   if (image) {
@@ -158,11 +168,14 @@ export function detectSessionAttachmentFileType(
     return { mimeType: "application/pdf", extension: "pdf" };
   }
 
-  // Markdown carries no magic bytes; accept anything that is well-formed UTF-8
-  // text (no NUL bytes). Binary formats are already handled above, so this only
+  // Text carries no magic bytes; accept anything that is well-formed UTF-8
+  // (no NUL bytes). Binary formats are already handled above, so this only
   // matches genuine text uploads.
   if (isUtf8TextBytes(bytes)) {
-    return { mimeType: "text/markdown", extension: "md" };
+    const mimeType = isSessionAttachmentTextMimeType(declaredMimeType)
+      ? declaredMimeType
+      : "text/markdown";
+    return { mimeType, extension: TEXT_ATTACHMENT_EXTENSIONS[mimeType] };
   }
 
   return null;
@@ -170,7 +183,7 @@ export function detectSessionAttachmentFileType(
 
 /**
  * Well-formed UTF-8 with no NUL byte. Used as the last-resort signal that an
- * attachment is text (Markdown), so it must reject anything binary: invalid or
+ * attachment is text (Markdown, JSON, HTML), so it must reject anything binary: invalid or
  * overlong sequences, truncated multibyte, surrogates, and NUL. Implemented by
  * hand rather than via TextDecoder so the accept/reject contract is explicit.
  */

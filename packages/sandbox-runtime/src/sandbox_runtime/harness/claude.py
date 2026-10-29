@@ -13,11 +13,19 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+import warnings
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import (
+    CanUseToolShadowedWarning,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 
 from ..attachment_processor import (
     MAX_SESSION_ATTACHMENTS_PER_MESSAGE,
@@ -66,7 +74,8 @@ THINKING_BUDGET_MODELS: Final = frozenset(
 THINKING_BUDGETS: Final = {"high": 16_000, "max": 31_999}
 EFFORT_LEVELS: Final = frozenset({"low", "medium", "high", "xhigh", "max"})
 
-# Everything the child may call; `dontAsk` approves what is listed and denies the rest.
+# Everything the child may call. `_approve_listed_tools` approves what is listed
+# and denies the rest; `deny` rules in the repo's settings still apply.
 ALLOWED_TOOLS: Final = (
     "Read",
     "Edit",
@@ -89,6 +98,9 @@ ALLOWED_TOOLS: Final = (
     "KillShell",
 )
 DISALLOWED_TOOLS: Final = ("AskUserQuestion",)
+# Whole-tool entries in `allowed_tools` skip the callback on purpose; it exists
+# for calls the CLI would otherwise prompt for.
+warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
 MAX_RECONNECTS_PER_SESSION: Final = 3
 # The CLI writes one NDJSON message per stdout line, and the SDK transport
 # fails the turn when a single line outgrows its buffer, so the ceiling has to
@@ -347,7 +359,10 @@ class ClaudeHarness:
             "mcp_servers": mcp_servers,
             "allowed_tools": allowed_tools,
             "disallowed_tools": [*DISALLOWED_TOOLS],
-            "permission_mode": "dontAsk",
+            # Not `dontAsk`: it turns the repo's `ask` rules (a team's
+            # "prompt before git commit") into denials no one can lift.
+            "permission_mode": "default",
+            "can_use_tool": _approve_listed_tools(allowed_tools),
             "system_prompt": system_prompt,
             "settings": CLAUDE_POLICY_SETTINGS,
             "setting_sources": ["user", "project"],
@@ -654,6 +669,27 @@ def _default_transcript_exists(session_id: str, workdir: Path, config_dir: Path)
         return False
     del workdir  # informational; the transcript is keyed by session id
     return any(path.is_file() for path in projects.glob(f"*/{session_id}.jsonl"))
+
+
+def _approve_listed_tools(allowed_tools: list[str]) -> Callable[..., Any]:
+    """Answer the CLI's permission prompts, since nobody is there to.
+
+    The CLI asks when a call matches an `ask` rule from the repo's settings, or
+    names a tool outside `allowed_tools`. Approve the first and deny the second,
+    which keeps `allowed_tools` the whole list of what the child may call.
+    """
+    names = {entry for entry in allowed_tools if not entry.endswith("*")}
+    prefixes = tuple(entry[:-1] for entry in allowed_tools if entry.endswith("*"))
+
+    async def can_use_tool(
+        tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        del tool_input, context
+        if tool_name in names or tool_name.startswith(prefixes):
+            return PermissionResultAllow()
+        return PermissionResultDeny(message=f"{tool_name} is not available in this sandbox.")
+
+    return can_use_tool
 
 
 def _default_options_factory(**kwargs: Any) -> Any:

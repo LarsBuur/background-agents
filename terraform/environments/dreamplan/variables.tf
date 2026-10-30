@@ -776,3 +776,9 @@ variable "allowed_github_orgs" {
   type        = string
   default     = ""
 }
+
+variable "extra_allowed_control_plane_hosts" {
+  description = "Other control plane hosts allowed to call the Modal app. Bandcizer shares this Modal workspace and secret, so its host must stay listed or its sandboxes are refused."
+  type        = list(string)
+  default     = ["open-inspect-control-plane-bandcizer.wizflow.workers.dev"]
+}

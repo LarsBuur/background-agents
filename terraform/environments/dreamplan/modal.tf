@@ -37,7 +37,7 @@ module "modal_app" {
       name = "internal-api"
       values = {
         MODAL_API_SECRET            = var.modal_api_secret
-        ALLOWED_CONTROL_PLANE_HOSTS = local.control_plane_host
+        ALLOWED_CONTROL_PLANE_HOSTS = join(",", concat([local.control_plane_host], var.extra_allowed_control_plane_hosts))
       }
     }
   ]
